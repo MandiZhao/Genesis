@@ -12,6 +12,64 @@ except Exception as e:
     print(f"[Error]: {e}\n")
 from genesis.utils.misc import tensor_to_array
 
+import torch 
+@torch.jit.script
+def get_expanded_mask(n_contacts, pair_a, pair_b, a_idxs, b_idxs):
+    """ 
+    Input:
+    - pair_a: (n_contacts, N) tensor of geom indices for entity A
+    - pair_b: (n_contacts, N) tensor of geom indices for entity B
+    - a_idxs: (n_a,) tensor of geom indices to filter for entity A
+    - b_idxs: (n_b,) tensor of geom indices to filter for entity B
+    Output:
+    - mask: (n_contacts, N, n_a, n_b) tensor of expanded mask. Use this to filter contacts
+    
+    Note that we need to flip the mask for both pairs 
+    """
+    pair_a[n_contacts.unsqueeze(0) <= torch.arange(pair_a.shape[0], device=pair_a.device).view(-1, 1)] = -3 
+    pair_b[n_contacts.unsqueeze(0) <= torch.arange(pair_b.shape[0], device=pair_b.device).view(-1, 1)] = -3
+    
+    assert a_idxs.ndim == 1 and b_idxs.ndim == 1, "a_idxs and b_idxs should be 1D tensors"
+    mask_a = pair_a.unsqueeze(-1) == a_idxs.view(1, 1, -1)
+    mask_b = pair_b.unsqueeze(-1) == b_idxs.view(1, 1, -1)
+    mask = torch.logical_and(mask_a.unsqueeze(-1), mask_b.unsqueeze(-2))
+    mask_a_flip = pair_a.unsqueeze(-1) == b_idxs.view(1, 1, -1)
+    mask_b_flip = pair_b.unsqueeze(-1) == a_idxs.view(1, 1, -1)
+    mask_flip = torch.logical_and(mask_a_flip.unsqueeze(-1), mask_b_flip.unsqueeze(-2))
+
+    mask = torch.logical_or(mask, mask_flip.transpose(-1, -2)) 
+    return mask 
+
+@torch.jit.script
+def get_grouped_contact_pos(contact_pos, contact_force_norm, mask):
+    """
+    Get the contact positions from the mask, this groups the contact positions by geom/link in entity A and all the valid contacts with entity B
+    Input: 
+    - contact_pos: (n_contacts, N, 3) tensor of contact positions
+    - contact_force_norm: (n_contacts, N) tensor of contact force norms
+    - mask: (n_contacts, N, n_a, n_b) tensor of expanded mask
+    Return:
+    - grouped_contact_pos: (N, n_a, n_b, 3) tensor of contact positions
+    - grouped_contact_pos_valid: (N, n_a, n_b) tensor of valid contact positions
+    """
+    device = contact_pos.device  
+    contact_force_norm = contact_force_norm.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+    pos_expanded = contact_pos.unsqueeze(-2).unsqueeze(-2) # (n_contacts, N, 1, 1, 3)
+    pos_masked = pos_expanded * mask.unsqueeze(-1)  # Mask invalid positions -> (n_contacts, N, n_a, n_b, 3)
+    weightd_pos = pos_expanded * contact_force_norm  # (n_contacts, N, 1, 1, 3)
+    weighted_pos_masked = weightd_pos * mask.unsqueeze(-1)  # Mask invalid positions -> (n_contacts, N, n_a, n_b, 3)
+    # Sum weighted positions and contact forces across all contacts (dim=0)
+    weighted_sum = torch.sum(weighted_pos_masked, dim=0)  # (N, n_a, n_b, 3)
+    force_sum = torch.sum(contact_force_norm * mask.unsqueeze(-1), dim=0)  # (N, n_a, n_b, 1)
+    # Compute the weighted average (avoid division by zero)
+    grouped_contact_pos = torch.where(
+        force_sum > 0,
+        weighted_sum / force_sum,
+        torch.zeros_like(weighted_sum)
+    )
+    # Compute validity (at least one valid contact)
+    grouped_contact_pos_valid = (force_sum > 0).squeeze(-1) # (N, n_a, n_b)
+    return grouped_contact_pos, grouped_contact_pos_valid
 
 class RasterizerContext:
     def __init__(self, options):
@@ -263,7 +321,7 @@ class RasterizerContext:
                         pyrender.Mesh.from_trimesh(
                             mesh=mesh,
                             poses=geom_T,
-                            smooth=geom.surface.smooth if "collision" not in rigid_entity.surface.vis_mode else False,
+                            smooth=geom.surface.smooth if "collision" not in rigid_entity.surface.vis_mode else False, 
                             double_sided=(
                                 geom.surface.double_sided if "collision" not in rigid_entity.surface.vis_mode else False
                             ),
@@ -296,12 +354,85 @@ class RasterizerContext:
             batch_idx = 0  # only visualize contact for the first scene
             for i_con in range(self.sim.rigid_solver.collider.n_contacts[batch_idx]):
                 contact_data = self.sim.rigid_solver.collider.contact_data[i_con, batch_idx]
-                contact_pos = np.array(contact_data.pos) + self.scene.envs_offset[batch_idx]
-
+                contact_pos = np.array(contact_data.pos) + self.scene.envs_offset[batch_idx] 
                 if self.sim.rigid_solver.links[contact_data["link_a"]].visualize_contact:
                     self.draw_contact_arrow(pos=contact_pos, force=-contact_data.force)
                 if self.sim.rigid_solver.links[contact_data["link_b"]].visualize_contact:
                     self.draw_contact_arrow(pos=contact_pos, force=contact_data.force)
+    
+    def update_filtered_contact(self, buffer_updates):
+        if self.sim.rigid_solver.is_active():
+            contact_data = self.sim.rigid_solver.collider.contact_data # taichi tensor
+            device = torch.device('cuda')
+            n_contacts = self.sim.rigid_solver.collider.n_contacts.to_torch(device=device)
+            link_a = contact_data.link_a.to_torch(device=device) # size [500, N]
+            link_b = contact_data.link_b.to_torch(device=device) # size [500, N]
+            force = contact_data.force.to_torch(device=device) # size [500, N, 3]
+            obj_entity = [entity for entity in self.sim.rigid_solver.entities if entity.n_links == 2]
+            if len(obj_entity) == 0:
+                return
+            obj_entity = obj_entity[0]
+            robot_entity = [entity for entity in self.sim.rigid_solver.entities if entity.n_links > 10]
+            if len(robot_entity) == 0:
+                return
+
+            link_b_idxs = []
+            for entity in robot_entity:
+                link_b_idxs += [link.idx for link in entity.links if link.n_geoms > 0] # links that contain collision geoms
+            link_b_idxs = torch.tensor(link_b_idxs).to(device)
+
+            link_a_idxs = torch.tensor([link.idx for link in obj_entity.links]).to(device) 
+            link_mask = get_expanded_mask(
+                n_contacts, link_a, link_b, link_a_idxs, link_b_idxs
+                ) # shape (n_contacts, N, n_link_a, n_link_b)
+            contact_force_norm = torch.norm(force, dim=-1) # size [500, N]
+            # force_a_link = index_contact_force(
+            #     force, link_a, link_b, link_a_idxs, link_b_idxs 
+            #     ) # shape (n_envs, n_link_a, n_link_b, 3)
+            contact_pos = contact_data.pos.to_torch(device=device) # size [500, N, 3]
+            link_a_pos, link_valid = get_grouped_contact_pos(contact_pos, contact_force_norm, link_mask) 
+            # link_a_pos, link_a_valid = get_per_geom_a_contact_pos(
+            #     contact_pos, force, link_a, link_b, link_a_idxs, link_b_idxs
+            # ) #  (n_contacts, N, n_geom_a, 3) 
+            for env_dim in range(link_a_pos.shape[0]): # (N, n_a, n_b, 3) 
+                # for link_dim in range(link_a_pos.shape[0]):
+                #     pos_ = link_a_pos[link_dim, env_dim].cpu().numpy()
+                #     mask = pos_.sum(axis=1) != 0
+                #     pos_ = pos_[mask]
+                #     pos_ += self.scene.envs_offset[env_dim]
+                #     color = np.array([1.0, 0.0, 0.0, 0.8]) if link_dim == 0 else np.array([0.0, 1.0, 0.0, 0.8])
+                #     # force_ = force_a_link[env_dim, link_dim].cpu().numpy()
+                #     self.draw_contact_points(pos_, color=color)
+                # reshape to (n_points, 3) 
+                pos_ = link_a_pos[env_dim].reshape(-1, 3).cpu().numpy() # (n_a*n_b, 3)
+                # get all the pos that are not all zeros
+                mask = pos_.sum(axis=1) != 0
+                pos_ = pos_[mask]
+                pos_ += self.scene.envs_offset[env_dim] # shape (1, 3) 
+                # self.draw_debug_points(pos_, colors=(1.0, 0.0, 0.0, 1.0))
+                color = np.array([1.0, 0.0, 0.0, 0.8])
+                self.draw_contact_points(pos_, color=color)
+    
+    def update_all_contact_pos(self, buffer_updates):
+        """
+        Read the contact positions and visualize the first env 
+        """
+        if self.sim.rigid_solver.is_active():
+            con_data = self.sim.rigid_solver.collider.contact_data
+            contact_pos = con_data.pos.to_numpy() # shape (n_contacts, N, 3)
+            env_idx = 0
+            contact_pos = contact_pos[:, env_idx] + self.scene.envs_offset[env_idx]
+            n_contacts = self.sim.rigid_solver.collider.n_contacts[env_idx]
+            poss = contact_pos[:n_contacts] # later ones might be non-zero values! But only first n_contacts are valid
+            self.draw_contact_points(poss, color=(1.0, 1.0, 0.0, 0.8))
+
+    def draw_contact_points(self, poss, color=(1.0, 0.0, 0.0, 0.8)): 
+        sphere_mesh = mu.create_sphere(radius=0.006, color=color)
+        if len(poss) == 0:
+            return 
+        poses = np.tile(np.eye(4), (len(poss), 1, 1))
+        poses[:, :3, 3] = poss 
+        self.add_dynamic_node(pyrender.Mesh.from_trimesh(sphere_mesh, poses=poses))
 
     def on_avatar(self):
         if self.sim.avatar_solver.is_active():
@@ -716,6 +847,8 @@ class RasterizerContext:
         self.update_tool(buffer_updates)
         self.update_rigid(buffer_updates)
         self.update_contact(buffer_updates)
+        self.update_filtered_contact(buffer_updates)
+        self.update_all_contact_pos(buffer_updates)
         self.update_avatar(buffer_updates)
         self.update_mpm(buffer_updates)
         self.update_sph(buffer_updates)

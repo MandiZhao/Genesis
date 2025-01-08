@@ -551,8 +551,9 @@ class Viewer(pyglet.window.Window):
         """
         if filename is None:
             filename = self._get_save_filename(["mp4"])
-
-        self.video_recorder.close()
+        if filename is None:
+            filename = "video.mp4"
+        self.video_recorder.close() 
         shutil.move(self.video_recorder.filename, filename)
 
     def on_close(self):

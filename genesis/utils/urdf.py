@@ -274,6 +274,13 @@ def parse_urdf(morph, surface):
         else:
             j_info["dofs_damping"] = gu.default_dofs_damping(j_info["n_dofs"])
             j_info["dofs_armature"] = gu.default_dofs_armature(j_info["n_dofs"])
+        
+        if j_info['name'] == "rotation":
+           print('WARNING: Special case for the ARCTIC object joints, set damping to 0.01 and armature to 0.0')
+           j_info['dofs_damping'] *= 0.1
+           # j_info['dofs_armature'] *= 10.0
+           j_info['dofs_kp'] *= 0.0
+           j_info['dofs_kv'] *= 0.0
 
         if joint.safety_controller is not None:
             if joint.safety_controller.k_position is not None:
