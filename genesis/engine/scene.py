@@ -79,6 +79,7 @@ class Scene(RBC):
         vis_options=VisOptions(),
         viewer_options=ViewerOptions(),
         renderer=Rasterizer(),
+        use_visualizer=False,
         show_viewer=True,
         show_FPS=True,
     ):
@@ -144,13 +145,16 @@ class Scene(RBC):
         )
 
         # visualizer
-        self._visualizer = Visualizer(
-            scene=self,
-            show_viewer=show_viewer,
-            vis_options=vis_options,
-            viewer_options=viewer_options,
-            renderer=renderer,
-        )
+        self._use_visualizer = use_visualizer
+        self._visualizer = None
+        if self._use_visualizer:
+            self._visualizer = Visualizer(
+                scene=self,
+                show_viewer=show_viewer,
+                vis_options=vis_options,
+                viewer_options=viewer_options,
+                renderer=renderer,
+            )
 
         # emitters
         self._emitters = gs.List()
@@ -491,7 +495,8 @@ class Scene(RBC):
         camera : genesis.Camera
             The created camera object.
         """
-
+        if not self._use_visualizer:
+            return 
         return self._visualizer.add_camera(res, pos, lookat, up, model, fov, aperture, focus_dist, GUI, spp, denoise)
 
     @gs.assert_unbuilt
@@ -603,8 +608,9 @@ class Scene(RBC):
                 self._reset()
 
         # visualizer
-        with gs.logger.timer("Building visualizer..."):
-            self._visualizer.build()
+        if self._use_visualizer:
+            with gs.logger.timer("Building visualizer..."):
+                self._visualizer.build()
 
         if self._show_FPS:
             self.FPS_tracker = FPSTracker(self.n_envs)
@@ -687,8 +693,8 @@ class Scene(RBC):
         self._t = 0
         self._forward_ready = True
         self._reset_grad()
-
-        self._visualizer.reset()
+        if self._use_visualizer:
+            self._visualizer.reset()
 
         for emitter in self._emitters:
             emitter.reset()
@@ -723,7 +729,7 @@ class Scene(RBC):
 
         self._t += 1
 
-        if update_visualizer:
+        if update_visualizer and self._use_visualizer:
             self._visualizer.update(force=False)
 
         if self._show_FPS:
