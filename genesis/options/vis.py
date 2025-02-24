@@ -84,6 +84,8 @@ class VisOptions(Options):
         Number of environments with being rendered. If None, all environments will be rendered. Defaults to None.
     lights  : list of dict.
         Lights added to the scene.
+    visualize_contact: bool
+        Whether to visualize contact forces and positions.
     """
 
     show_world_frame: bool = True
@@ -111,6 +113,7 @@ class VisOptions(Options):
     lights: list = [
         {"type": "directional", "dir": (-1, -1, -1), "color": (1.0, 1.0, 1.0), "intensity": 5.0},
     ]
+    visualize_contact: bool = False
 
     def __init__(self, **data):
         super().__init__(**data)

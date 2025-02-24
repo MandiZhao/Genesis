@@ -91,7 +91,7 @@ class RasterizerContext:
         self.contact_force_scale = options.contact_force_scale
         self.render_particle_as = options.render_particle_as
         self.n_rendered_envs = options.n_rendered_envs
-
+        self.visualize_contact = options.visualize_contact
         self.init_meshes()
 
     def init_meshes(self):
@@ -892,9 +892,10 @@ class RasterizerContext:
         self.update_link_frame(buffer_updates)
         self.update_tool(buffer_updates)
         self.update_rigid(buffer_updates)
-        self.update_contact(buffer_updates)
-        self.update_filtered_contact(buffer_updates)
-        self.update_all_contact_pos(buffer_updates)
+        if self.visualize_contact:
+            self.update_contact(buffer_updates)
+            self.update_filtered_contact(buffer_updates)
+            self.update_all_contact_pos(buffer_updates)
         self.update_avatar(buffer_updates)
         self.update_mpm(buffer_updates)
         self.update_sph(buffer_updates)
