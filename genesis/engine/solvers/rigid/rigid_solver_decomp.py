@@ -3519,6 +3519,17 @@ class RigidSolver(Solver):
                 self.dofs_info[I].sol_params[j] = sol_params[j]
 
             self.dofs_info[I].sol_params[0] = self._substep_dt * 2
+    
+    def set_geom_sol_params(self, sol_params):
+        assert len(sol_params) == 7
+        self._kernel_set_geom_sol_params(sol_params)
+    
+    @ti.kernel
+    def _kernel_set_geom_sol_params(self, sol_params: ti.types.ndarray()):
+        ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
+        for i in range(self.n_geoms):
+            for j in ti.static(range(7)):
+                self.geoms_info[i].sol_params[j] = sol_params[j]
 
     def _set_dofs_info(self, tensor_list, dofs_idx, name, envs_idx=None):
         if self._options.batch_dofs_info:
