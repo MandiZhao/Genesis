@@ -209,6 +209,7 @@ class RigidOptions(Options):
 
     # mapping from link ids to group (finger, palm, etc.) ids
     link_group_mapping: Optional[dict] = None
+    self_collision_group_filter: bool = False
 
     def __init__(self, **data):
         super().__init__(**data)
