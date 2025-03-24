@@ -207,6 +207,10 @@ class RigidOptions(Options):
     hibernation_thresh_vel: float = 1e-3
     hibernation_thresh_acc: float = 1e-2
 
+    # mapping from link ids to group (finger, palm, etc.) ids
+    link_group_mapping: Optional[dict] = None
+    self_collision_group_filter: bool = False
+
     def __init__(self, **data):
         super().__init__(**data)
 

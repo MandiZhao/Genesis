@@ -62,6 +62,30 @@ class Collider:
             self.vert_neighbor_start.from_numpy(vert_neighbor_start)
             self.vert_n_neighbors.from_numpy(vert_n_neighbors)
 
+    def _init_link_group_mapping(self):
+        # if self._solver._self_collision_group_filter and self._solver._options.link_group_mapping is not None:
+        # max_link_id = max(self._solver._options.link_group_mapping.keys())
+        max_link_id = self._solver.n_links - 1
+        if self._solver._options.batch_links_info:
+            n_envs = self._solver._n_envs
+            self._link_group_field = ti.field(ti.i32, shape=(max_link_id + 1, n_envs))
+            if self._solver._options.link_group_mapping is not None:
+                for i_link, group in self._solver._options.link_group_mapping.items():
+                    for i_env in range(n_envs):
+                        self._link_group_field[i_link, i_env] = group
+            else:
+                for i_link in range(max_link_id + 1):
+                    for i_env in range(n_envs):
+                        self._link_group_field[i_link, i_env] = i_link
+        else:
+            self._link_group_field = ti.field(ti.i32, shape=max_link_id + 1)
+            if self._solver._options.link_group_mapping is not None:
+                for i_link, group in self._solver._options.link_group_mapping.items():
+                    self._link_group_field[i_link] = group
+            else:
+                for i_link in range(max_link_id + 1):
+                    self._link_group_field[i_link] = i_link
+
     def _init_collision_fields(self):
         # compute collision pairs
         # convert to numpy array for faster retrieval
@@ -69,6 +93,7 @@ class Collider:
         links_root_idx = self._solver.links_info.root_idx.to_numpy()
         links_parent_idx = self._solver.links_info.parent_idx.to_numpy()
         links_is_fixed = self._solver.links_info.is_fixed.to_numpy()
+        self._init_link_group_mapping()
         if self._solver._options.batch_links_info:
             links_root_idx = links_root_idx[:, 0]
             links_parent_idx = links_parent_idx[:, 0]
@@ -94,6 +119,10 @@ class Collider:
                 # pair of fixed base links
                 if links_is_fixed[i_la] and links_is_fixed[i_lb]:
                     continue
+
+                if self._solver._self_collision_group_filter:
+                    if self._solver._options.link_group_mapping[i_la] == self._solver._options.link_group_mapping[i_lb]:
+                        continue
 
                 n_possible_pairs += 1
 
@@ -597,22 +626,28 @@ class Collider:
             is_valid = False
 
         # self collision
-        if (
+        if is_valid and (
             ti.static(not self._solver._enable_self_collision)
             and self._solver.links_info[I_la].root_idx == self._solver.links_info[I_lb].root_idx
         ):
             is_valid = False
 
+        if is_valid and (
+            ti.static(self._solver._self_collision_group_filter)
+        ):
+            if self._link_group_field[I_la] == self._link_group_field[I_lb]:
+                is_valid = False
+
         # adjacent links
-        if self._solver.links_info[I_la].parent_idx == i_lb or self._solver.links_info[I_lb].parent_idx == i_la:
+        if is_valid and self._solver.links_info[I_la].parent_idx == i_lb or self._solver.links_info[I_lb].parent_idx == i_la:
             is_valid = False
 
         # pair of fixed links
-        if self._solver.links_info[I_la].is_fixed and self._solver.links_info[I_lb].is_fixed:
+        if is_valid and self._solver.links_info[I_la].is_fixed and self._solver.links_info[I_lb].is_fixed:
             is_valid = False
 
         # hibernated <-> fixed links
-        if ti.static(self._solver._use_hibernation):
+        if is_valid and ti.static(self._solver._use_hibernation):
             if (self._solver.links_state[i_la, i_b].hibernated and self._solver.links_info[I_lb].is_fixed) or (
                 self._solver.links_state[i_lb, i_b].hibernated and self._solver.links_info[I_la].is_fixed
             ):
