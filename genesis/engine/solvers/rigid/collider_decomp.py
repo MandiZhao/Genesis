@@ -99,10 +99,13 @@ class Collider:
             links_parent_idx = links_parent_idx[:, 0]
             links_is_fixed = links_is_fixed[:, 0]
         n_possible_pairs = 0
+        if self._solver._self_collision_group_filter:
+            # get the local link idx for all geoms: 
+            geom_global_link_idx = self._solver.geoms_info.link_idx_local.to_numpy()
         for i in range(self._solver.n_geoms):
             for j in range(i + 1, self._solver.n_geoms):
                 i_la = geoms_link_idx[i]
-                i_lb = geoms_link_idx[j]
+                i_lb = geoms_link_idx[j] 
 
                 # geoms in the same link
                 if i_la == i_lb:
@@ -121,8 +124,12 @@ class Collider:
                     continue
 
                 if self._solver._self_collision_group_filter:
-                    if self._solver._options.link_group_mapping[i_la] == self._solver._options.link_group_mapping[i_lb]:
-                        continue
+                    i_la_loc = geom_global_link_idx[i]
+                    i_lb_loc = geom_global_link_idx[j]
+                    # if a geom's group is not specified, check collision 
+                    if i_la_loc in self._solver._options.link_group_mapping and i_lb_loc in self._solver._options.link_group_mapping:
+                        if self._solver._options.link_group_mapping[i_la_loc] == self._solver._options.link_group_mapping[i_lb_loc]:
+                            continue
 
                 n_possible_pairs += 1
 

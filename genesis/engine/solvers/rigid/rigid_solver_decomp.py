@@ -715,6 +715,7 @@ class RigidSolver(Solver):
             coup_friction=gs.ti_float,
             coup_softness=gs.ti_float,
             coup_restitution=gs.ti_float,
+            link_idx_local=gs.ti_int,
         )
         struct_geom_state = ti.types.struct(
             pos=gs.ti_vec3,
@@ -758,6 +759,7 @@ class RigidSolver(Solver):
                 geoms_coup_softness=np.array([geom.coup_softness for geom in geoms], dtype=gs.np_float),
                 geoms_coup_friction=np.array([geom.coup_friction for geom in geoms], dtype=gs.np_float),
                 geoms_coup_restitution=np.array([geom.coup_restitution for geom in geoms], dtype=gs.np_float),
+                geoms_link_idx_local=np.array([geom.link.idx_local for geom in geoms], dtype=gs.np_int),
             )
 
     @ti.kernel
@@ -781,6 +783,7 @@ class RigidSolver(Solver):
         geoms_coup_softness: ti.types.ndarray(),
         geoms_coup_friction: ti.types.ndarray(),
         geoms_coup_restitution: ti.types.ndarray(),
+        geoms_link_idx_local: ti.types.ndarray(),
     ):
         ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
         for i in range(self.n_geoms):
@@ -820,6 +823,7 @@ class RigidSolver(Solver):
             self.geoms_info[i].coup_friction = geoms_coup_friction[i]
             self.geoms_info[i].coup_restitution = geoms_coup_restitution[i]
 
+            self.geoms_info[i].link_idx_local = geoms_link_idx_local[i]
             # compute init AABB
             lower = gu.ti_vec3(ti.math.inf)
             upper = gu.ti_vec3(-ti.math.inf)
@@ -877,6 +881,7 @@ class RigidSolver(Solver):
             vface_num=gs.ti_int,
             vface_start=gs.ti_int,
             vface_end=gs.ti_int,
+            link_idx_local=gs.ti_int,   
         )
         struct_vgeom_state = ti.types.struct(
             pos=gs.ti_vec3,
@@ -898,6 +903,7 @@ class RigidSolver(Solver):
                 vgeoms_vface_start=np.array([vgeom.vface_start for vgeom in vgeoms], dtype=gs.np_int),
                 vgeoms_vvert_end=np.array([vgeom.vvert_end for vgeom in vgeoms], dtype=gs.np_int),
                 vgeoms_vface_end=np.array([vgeom.vface_end for vgeom in vgeoms], dtype=gs.np_int),
+                vgeoms_link_idx_local=np.array([vgeom.link.idx_local for vgeom in vgeoms], dtype=gs.np_int),
             )
 
     @ti.kernel
@@ -910,6 +916,7 @@ class RigidSolver(Solver):
         vgeoms_vface_start: ti.types.ndarray(),
         vgeoms_vvert_end: ti.types.ndarray(),
         vgeoms_vface_end: ti.types.ndarray(),
+        vgeoms_link_idx_local: ti.types.ndarray(),
     ):
         ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
         for i in range(self.n_vgeoms):
@@ -928,6 +935,7 @@ class RigidSolver(Solver):
             self.vgeoms_info[i].vface_num = vgeoms_vface_end[i] - vgeoms_vface_start[i]
 
             self.vgeoms_info[i].link_idx = vgeoms_link_idx[i]
+            self.vgeoms_info[i].link_idx_local = vgeoms_link_idx_local[i]
 
     def _init_entity_fields(self):
         if self._use_hibernation:
