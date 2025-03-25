@@ -622,8 +622,8 @@ class Collider:
 
     @ti.func
     def _func_check_collision_valid(self, i_ga, i_gb, i_b):
-        i_la = self._solver.geoms_info[i_ga].link_idx
-        i_lb = self._solver.geoms_info[i_gb].link_idx
+        i_la = self._solver.geoms_info[i_ga].link_idx 
+        i_lb = self._solver.geoms_info[i_gb].link_idx 
         I_la = [i_la, i_b] if ti.static(self._solver._options.batch_links_info) else i_la
         I_lb = [i_lb, i_b] if ti.static(self._solver._options.batch_links_info) else i_lb
         is_valid = True
@@ -639,11 +639,11 @@ class Collider:
         ):
             is_valid = False
 
-        if is_valid and (
-            ti.static(self._solver._self_collision_group_filter)
-        ):
-            if self._link_group_field[I_la] == self._link_group_field[I_lb]:
-                is_valid = False
+        # if is_valid and (
+        #     ti.static(self._solver._self_collision_group_filter)
+        # ):
+        #     if self._link_group_field[I_la] == self._link_group_field[I_lb]:
+                # is_valid = False
 
         # adjacent links
         if is_valid and self._solver.links_info[I_la].parent_idx == i_lb or self._solver.links_info[I_lb].parent_idx == i_la:
