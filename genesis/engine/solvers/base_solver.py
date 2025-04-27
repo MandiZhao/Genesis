@@ -17,7 +17,7 @@ class Solver(RBC):
             self._gravity = ti.field(dtype=gs.ti_vec3, shape=())
             self._gravity.from_numpy(np.array(options.gravity, dtype=gs.np_float))
         else:
-            self._gravity = None
+            self._gravity = None 
 
         self._entities = gs.List()
 

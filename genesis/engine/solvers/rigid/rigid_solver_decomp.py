@@ -21,8 +21,7 @@ class RigidSolver(Solver):
     # ------------------------------------------------------------------------------------
 
     def __init__(self, scene, sim, options):
-        super().__init__(scene, sim, options)
-
+        super().__init__(scene, sim, options) 
         # options
         self._enable_collision = options.enable_collision
         self._enable_joint_limit = options.enable_joint_limit
@@ -3538,7 +3537,20 @@ class RigidSolver(Solver):
         ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.PARTIAL)
         for i in range(self.n_geoms):
             for j in ti.static(range(7)):
-                self.geoms_info[i].sol_params[j] = sol_params[j]
+                self.geoms_info[i].sol_params[j] = sol_params[j] 
+
+    # NEW(Mandi): add gravity set 
+    @ti.kernel
+    def _kernel_set_gravity(self, gravity: ti.types.ndarray()):
+        ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.ALL)
+        for i in ti.static(range(3)):
+            self._gravity[i] = gravity[i]
+    
+    def set_gravity(self, gravity_tuple):
+        assert len(gravity_tuple) == 3
+        self._gravity.fill(gravity_tuple) # type is <class 'taichi.lang.matrix.MatrixField'>
+        # self._kernel_set_gravity(gravity)
+
 
     def _set_dofs_info(self, tensor_list, dofs_idx, name, envs_idx=None):
         if self._options.batch_dofs_info:
