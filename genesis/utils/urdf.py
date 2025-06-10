@@ -57,13 +57,19 @@ def parse_urdf(morph, surface):
         path = os.path.join(get_assets_dir(), morph.file)
         robot = urdfpy.URDF.load(path)
     else:
-        robot = morph.file
-
+        import pathlib
+        if isinstance(morph.file, pathlib.Path):
+            path = str(morph.file.absolute())
+            robot = urdfpy.URDF.load(path)
+        else:
+            raise TypeError(
+                f"Expected morph.file to be a string or pathlib.Path, got {type(morph.file)}"
+            ) 
     # merge links connected by fixed joints
     if hasattr(morph, "merge_fixed_links") and morph.merge_fixed_links:
         robot = merge_fixed_links(robot, morph.links_to_keep)
 
-    link_name_to_idx = dict()
+    link_name_to_idx = dict() 
     for idx, link in enumerate(robot.links):
         link_name_to_idx[link.name] = idx
 
