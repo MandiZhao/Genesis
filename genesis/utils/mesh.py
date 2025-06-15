@@ -123,7 +123,7 @@ def compute_sdf_data(mesh, res):
     X, Y, Z = np.meshgrid(x, y, z, indexing="ij")
     query_points = np.stack([X, Y, Z], axis=-1).reshape((-1, 3))
 
-    voxels = igl.signed_distance(query_points, mesh.vertices, mesh.faces)[0]
+    voxels, *_ = igl.signed_distance(query_points, mesh.vertices, mesh.faces)[0]
     voxels = voxels.reshape([res, res, res])
 
     T_mesh_to_sdf = np.eye(4)
