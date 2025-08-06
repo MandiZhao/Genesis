@@ -9,6 +9,8 @@ import numpy as np
 from OpenGL.GL import *
 from OpenGL.GL.EXT import texture_filter_anisotropic
 
+import genesis as gs
+
 from .utils import format_texture_source
 from .sampler import Sampler
 
@@ -185,7 +187,7 @@ class Texture(object):
         width = self.width
         height = self.height
         if self.source is not None:
-            data = np.ascontiguousarray(np.flip(self.source, axis=0).flatten())
+            data = np.flip(self.source, axis=0).reshape((-1,))
             width = self.source.shape[1]
             height = self.source.shape[0]
 
@@ -211,13 +213,16 @@ class Texture(object):
 
         glTexParameteri(self.tex_type, GL_TEXTURE_WRAP_S, self.sampler.wrapS)
         glTexParameteri(self.tex_type, GL_TEXTURE_WRAP_T, self.sampler.wrapT)
-        border_color = 255 * np.ones(4).astype(np.uint8)
+        border_color = np.full((4,), fill_value=255, dtype=np.uint8)
         if self.data_format == GL_FLOAT:
-            border_color = np.ones(4).astype(np.float32)
+            border_color = np.ones((4,), dtype=np.float32)
         glTexParameterfv(self.tex_type, GL_TEXTURE_BORDER_COLOR, border_color)
 
-        max_aniso = glGetFloat(texture_filter_anisotropic.GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT)
-        glTexParameterf(GL_TEXTURE_2D, texture_filter_anisotropic.GL_TEXTURE_MAX_ANISOTROPY_EXT, max_aniso)
+        if texture_filter_anisotropic.glInitTextureFilterAnisotropicEXT():
+            max_aniso = glGetFloat(texture_filter_anisotropic.GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT)
+            glTexParameterf(GL_TEXTURE_2D, texture_filter_anisotropic.GL_TEXTURE_MAX_ANISOTROPY_EXT, max_aniso)
+        else:
+            gs.logger.debug("Current OpenGL context does not support anisotropic filtering. Disabling it...")
 
         # Unbind texture
         glBindTexture(self.tex_type, 0)

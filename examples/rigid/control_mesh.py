@@ -30,6 +30,7 @@ def main():
         vis_options=gs.options.VisOptions(
             show_link_frame=True,
         ),
+        show_viewer=args.vis,
     )
 
     ########################## entities ##########################
@@ -43,7 +44,7 @@ def main():
     ########################## build ##########################
     scene.build()
 
-    dofs_idx = duck.joints[0].dof_idx
+    dofs_idx = duck.base_joint.dofs_idx
 
     duck.set_dofs_kv(
         np.array([1, 1, 1, 1, 1, 1]) * 50.0,

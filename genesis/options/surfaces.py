@@ -254,10 +254,11 @@ class Surface(Options):
             ):
                 rgba_array = np.dstack((texture.image_array, opacity_texture.image_array))
                 rgba_scale = (*texture.image_color, *opacity_texture.image_color)
+
             else:
                 if isinstance(opacity_texture, ImageTexture) and opacity_texture.image_array is not None:
                     gs.logger.warning("Color and opacity image shapes do not match. Fall back to fully opaque texture.")
-                a_array = np.full((*texture.image_array.shape[:2],), 255, dtype=np.uint8)
+                a_array = np.full(texture.image_array.shape[:2], 255, dtype=np.uint8)
                 rgba_array = np.dstack((texture.image_array, a_array))
                 rgba_scale = (*texture.image_color, 1.0)
 
@@ -633,12 +634,14 @@ class Reflective(Plastic):
 
 class Collision(Plastic):
     """
-    Default surface type for collision geometry with a grey color.
+    Default surface type for collision geometry with a grey color by default.
     """
+
+    color: tuple = (0.5, 0.5, 0.5)
 
     def __init__(self, **data):
         super().__init__(**data)
-        self.diffuse_texture = ColorTexture(color=(0.5, 0.5, 0.5))
+        self.diffuse_texture = ColorTexture(color=self.color)
 
 
 class Water(Glass):

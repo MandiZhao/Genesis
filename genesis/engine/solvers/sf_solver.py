@@ -41,6 +41,7 @@ class SFSolver(Solver):
         self.jets = jets
 
     def build(self):
+        super().build()
         if self.is_active():
             self.t = 0.0
             self.setup_fields()
@@ -271,7 +272,7 @@ class SFSolver(Solver):
     def get_state(self, f):
         return None
 
-    def set_state(self, f, state):
+    def set_state(self, f, state, envs_idx=None):
         return None
 
     # ------------------------------------------------------------------------------------

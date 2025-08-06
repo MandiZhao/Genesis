@@ -6,7 +6,7 @@ from .options import Options
 from .surfaces import Surface
 
 
-class Renderer(Options):
+class RendererOptions(Options):
     """
     This is the base class for all `gs.renderers.*` classes.
     Note that this is not an actual renderer, but rather a renderer configuration specifying which renderer to use and its parameters.
@@ -15,7 +15,7 @@ class Renderer(Options):
     pass
 
 
-class Rasterizer(Renderer):
+class Rasterizer(RendererOptions):
     """
     Rasterizer renderer. This has no parameter to be configured.
 
@@ -27,7 +27,7 @@ class Rasterizer(Renderer):
     pass
 
 
-class RayTracer(Renderer):
+class RayTracer(RendererOptions):
     """
     RayTracer renderer.
 
@@ -37,8 +37,8 @@ class RayTracer(Renderer):
 
     Parameters
     ----------
-    cuda_device : int, optional
-        CUDA device ID. Defaults to 0.
+    device_index : int, optional
+        Device ID used for the raytracer. Defaults to 0.
     logging_level : str, optional
         Logging level. Should be one of "debug", "info", "warning". Defaults to "warning".
     state_limit : int, optional
@@ -49,8 +49,6 @@ class RayTracer(Renderer):
         Russian Roulette depth. Defaults to 0.
     rr_threshold : float, optional
         Russian Roulette threshold. Defaults to 0.95.
-    denoise : bool, optional
-        Whether to use AI denoiser. Defaults to True.
     env_surface : Optional[Surface], optional
         Environment surface. Defaults to None.
     env_radius : float, optional
@@ -67,7 +65,7 @@ class RayTracer(Renderer):
         Lower bound for direct face normal vs vertex normal for face normal interpolation. Range is [0, 180]. Defaults to 180.
     """
 
-    cuda_device: int = 0
+    device_index: int = 0
     logging_level: str = "warning"
     state_limit: int = 2**25
     tracing_depth: int = 32
@@ -95,6 +93,23 @@ class RayTracer(Renderer):
 
         if self.env_euler is not None:
             if self.env_quat is None:
-                self.env_quat = gs.utils.geom.xyz_to_quat(np.array(self.env_euler))
+                self.env_quat = gs.utils.geom.xyz_to_quat(np.array(self.env_euler), rpy=True, degrees=True)
             else:
                 gs.logger.warning("`env_euler` is ignored when `env_quat` is specified.")
+
+
+class BatchRenderer(RendererOptions):
+    """
+    BatchRenderer renderer.
+
+    Note
+    ----
+    This renderer is used to render the scene in a batch.
+
+    Parameters
+    ----------
+    use_rasterizer : bool, optional
+        Whether to use the rasterizer renderer. Defaults to False.
+    """
+
+    use_rasterizer: bool = False

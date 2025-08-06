@@ -3,7 +3,7 @@
 ![Teaser](imgs/teaser.png)
 
 [![PyPI - Version](https://img.shields.io/pypi/v/genesis-world)](https://pypi.org/project/genesis-world/)
-[![PyPI - Downloads](https://img.shields.io/pypi/dm/genesis-world)](https://pypi.org/project/genesis-world/)
+[![PyPI Downloads](https://static.pepy.tech/badge/genesis-world)](https://pepy.tech/projects/genesis-world)
 [![GitHub Issues](https://img.shields.io/github/issues/Genesis-Embodied-AI/Genesis)](https://github.com/Genesis-Embodied-AI/Genesis/issues)
 [![GitHub Discussions](https://img.shields.io/github/discussions/Genesis-Embodied-AI/Genesis)](https://github.com/Genesis-Embodied-AI/Genesis/discussions)
 [![Discord](https://img.shields.io/discord/1322086972302430269?logo=discord)](https://discord.gg/nukCuhB47p)
@@ -18,6 +18,7 @@
 # Genesis
 
 ## 🔥 News
+- [2025-07-02] The development of Genesis is now officially supported by [Genesis AI](https://genesis-ai.company/).
 - [2025-01-09] We released a [detailed performance benchmarking and comparison report](https://github.com/zhouxian/genesis-speed-benchmark) on Genesis, together with all the test scripts.
 - [2025-01-08] Released v0.2.1 🎊 🎉
 - [2025-01-08] Created [Discord](https://discord.gg/nukCuhB47p) and [Wechat](https://drive.google.com/uc?export=view&id=1ZS9nnbQ-t1IwkzJlENBYqYIIOOZhXuBZ) group.
@@ -76,15 +77,20 @@ Install **PyTorch** first following the [official instructions](https://pytorch.
 
 Then, install Genesis via PyPI:
 ```bash
-pip install genesis-world  # Requires Python >=3.9;
+pip install genesis-world  # Requires Python>=3.10,<3.14;
 ```
 
-For the latest version, clone the repository and install locally:
+For the latest version to date, make sure that `pip` is up-to-date via `pip install --upgrade pip`, then run command:
+```bash
+pip install git+https://github.com/Genesis-Embodied-AI/Genesis.git
+```
+Note that the package must still be updated manually to sync with main branch.
 
+Users seeking to edit the source code of Genesis are encourage to install Genesis in editable mode. First, make sure that `genesis-world` has been uninstalled, then clone the repository and install locally:
 ```bash
 git clone https://github.com/Genesis-Embodied-AI/Genesis.git
 cd Genesis
-pip install -e .
+pip install -e ".[dev]"
 ```
 
 ## Docker
@@ -107,6 +113,31 @@ docker run --gpus all --rm -it \
 -v $PWD:/workspace \
 genesis
 ```
+
+### AMD users
+AMD users can use Genesis using the `docker/Dockerfile.amdgpu` file, which is built by running:
+```
+docker build -t genesis-amd -f docker/Dockerfile.amdgpu docker
+```
+
+and can then be used by running:
+
+```xhost +local:docker \
+docker run -it --network=host \
+ --device=/dev/kfd \
+ --device=/dev/dri \
+ --group-add=video \
+ --ipc=host \
+ --cap-add=SYS_PTRACE \
+ --security-opt seccomp=unconfined \
+ --shm-size 8G \
+ -v $PWD:/workspace \
+ -e DISPLAY=$DISPLAY \
+ genesis-amd
+ ```
+
+The examples will be accessible from `/workspace/examples`. Note: AMD users should use the vulkan backend. This means you will need to call `gs.init(vulkan)` to initialise Genesis.
+
 
 ## Documentation
 
@@ -141,6 +172,7 @@ Genesis's development has been made possible thanks to these open-source project
 - [libccd](https://github.com/danfis/libccd): Reference for collision detection.
 - [PyRender](https://github.com/mmatl/pyrender): Rasterization-based renderer.
 - [LuisaCompute](https://github.com/LuisaGroup/LuisaCompute) and [LuisaRender](https://github.com/LuisaGroup/LuisaRender): Ray-tracing DSL.
+- [Madrona](https://github.com/shacklettbp/madrona) and [Madrona-mjx](https://github.com/shacklettbp/madrona_mjx): Batch renderer backend
 
 ## Associated Papers
 
@@ -173,9 +205,9 @@ Genesis is a large scale effort that integrates state-of-the-art technologies of
 If you use Genesis in your research, please consider citing:
 
 ```bibtex
-@software{Genesis,
+@misc{Genesis,
   author = {Genesis Authors},
-  title = {Genesis: A Universal and Generative Physics Engine for Robotics and Beyond},
+  title = {Genesis: A Generative and Universal Physics Engine for Robotics and Beyond},
   month = {December},
   year = {2024},
   url = {https://github.com/Genesis-Embodied-AI/Genesis}

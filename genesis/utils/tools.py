@@ -29,7 +29,7 @@ def animate(imgs, filename=None, fps=60):
         filename = os.path.splitext(os.path.basename(caller_file))[0] + f'_{time.strftime("%Y%m%d_%H%M%S")}.mp4'
     os.makedirs(os.path.abspath(os.path.dirname(filename)), exist_ok=True)
 
-    gs.logger.info(f"Saving video to ~<{filename}>~.")
+    gs.logger.info(f'Saving video to ~<"{filename}">~...')
     from moviepy import ImageSequenceClip
 
     imgs = ImageSequenceClip(imgs, fps=fps)
@@ -39,7 +39,7 @@ def animate(imgs, filename=None, fps=60):
         logger=None,
         codec="libx264",
         preset="ultrafast",
-        ffmpeg_params=["-crf", "0"],
+        # ffmpeg_params=["-crf", "0"],
     )
     gs.logger.info("Video saved.")
 
@@ -65,6 +65,8 @@ class Timer:
         self.just_reset = True
         if self.level == 0 and not self.skip:
             print("─" * os.get_terminal_size()[0])
+        if self.ti_sync and not self.skip:
+            ti.sync()
         self.prev_time = self.init_time = time.perf_counter()
 
     def _stamp(self, msg="", _ratio=1.0):
@@ -171,18 +173,26 @@ class Rate:
 
 
 class FPSTracker:
-    def __init__(self, n_envs, alpha=0.95, compensate_logging_cost=True):
-        self.last_time = time.perf_counter()
+    def __init__(self, n_envs, alpha=0.95):
+        self.last_time = None
         self.n_envs = n_envs
-        self.dt = 0
+        self.dt_ema = None
         self.alpha = alpha
-        self.compensate_logging_cost = compensate_logging_cost
 
     def step(self):
         current_time = time.perf_counter()
-        dt = current_time - self.last_time
-        self.dt = self.alpha * self.dt + (1 - self.alpha) * dt
-        fps = 1 / self.dt
+
+        if self.last_time:
+            dt = current_time - self.last_time
+        else:
+            self.last_time = current_time
+            return
+
+        if self.dt_ema:
+            self.dt_ema = self.alpha * self.dt_ema + (1 - self.alpha) * dt
+        else:
+            self.dt_ema = dt
+        fps = 1 / self.dt_ema
         if self.n_envs > 0:
             self.total_fps = fps * self.n_envs
             gs.logger.info(
@@ -191,17 +201,4 @@ class FPSTracker:
         else:
             self.total_fps = fps
             gs.logger.info(f"Running at ~<{fps:.2f}>~ FPS.")
-        if self.compensate_logging_cost:  # skip logging cost
-            self.last_time = time.perf_counter()
-        else:
-            self.last_time = current_time
-
-
-def run_in_another_thread(fn, args):
-    """
-    Use this for running simulation loop in order to use viewer in non-linux system
-    """
-    if gs.platform == "Linux":
-        gs.raise_exception("Use this only for non-linux system")
-
-    threading.Thread(target=fn, args=args).start()
+        self.last_time = current_time

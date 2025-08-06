@@ -1,15 +1,29 @@
+import os
+import pickle
+import time
+
 import numpy as np
 import torch
+import taichi as ti
+from numpy.typing import ArrayLike
 
 import genesis as gs
+import genesis.utils.geom as gu
+from genesis.utils.misc import ALLOCATE_TENSOR_WARNING
+from genesis.engine.entities.base_entity import Entity
+from genesis.engine.force_fields import ForceField
+from genesis.engine.materials.base import Material
 from genesis.engine.entities import Emitter
+from genesis.engine.states.solvers import SimState
 from genesis.engine.simulator import Simulator
 from genesis.options import (
     AvatarOptions,
-    CouplerOptions,
+    BaseCouplerOptions,
+    LegacyCouplerOptions,
     FEMOptions,
     MPMOptions,
     PBDOptions,
+    ProfilingOptions,
     RigidOptions,
     SFOptions,
     SimOptions,
@@ -18,10 +32,14 @@ from genesis.options import (
     ViewerOptions,
     VisOptions,
 )
-from genesis.options.renderers import Rasterizer, Renderer
+from genesis.options.morphs import Morph
+from genesis.options.surfaces import Surface
+from genesis.options.renderers import Rasterizer, RendererOptions
 from genesis.repr_base import RBC
 from genesis.utils.tools import FPSTracker
+from genesis.utils.misc import redirect_libc_stderr, tensor_to_array
 from genesis.vis import Visualizer
+from genesis.utils.warnings import warn_once
 
 
 @gs.assert_initialized
@@ -56,8 +74,8 @@ class Scene(RBC):
         The options configuring the visualization system (``scene.visualizer``). Visualizer controls both the interactive viewer and the cameras.
     viewer_options : gs.options.ViewerOptions
         The options configuring the viewer (``scene.visualizer.viewer``).
-    renderer : gs.renderers.Renderer
-        The renderer used by `camera` for rendering images. This doesn't affect the behavior of the interactive viewer.
+    renderer : gs.renderers.RendererOptions
+        The renderer options used by `camera` for rendering images. This doesn't affect the behavior of the interactive viewer.
     show_viewer : bool
         Whether to show the interactive viewer. Set it to False if you only need headless rendering.
     show_FPS : bool
@@ -66,27 +84,43 @@ class Scene(RBC):
 
     def __init__(
         self,
-        sim_options=SimOptions(),
-        coupler_options=CouplerOptions(),
-        tool_options=ToolOptions(),
-        rigid_options=RigidOptions(),
-        avatar_options=AvatarOptions(),
-        mpm_options=MPMOptions(),
-        sph_options=SPHOptions(),
-        fem_options=FEMOptions(),
-        sf_options=SFOptions(),
-        pbd_options=PBDOptions(),
-        vis_options=VisOptions(),
-        viewer_options=ViewerOptions(),
-        renderer=Rasterizer(),
-        use_visualizer=False,
-        show_viewer=True,
-        show_FPS=True,
+        sim_options: SimOptions | None = None,
+        coupler_options: BaseCouplerOptions | None = None,
+        tool_options: ToolOptions | None = None,
+        rigid_options: RigidOptions | None = None,
+        avatar_options: AvatarOptions | None = None,
+        mpm_options: MPMOptions | None = None,
+        sph_options: SPHOptions | None = None,
+        fem_options: FEMOptions | None = None,
+        sf_options: SFOptions | None = None,
+        pbd_options: PBDOptions | None = None,
+        vis_options: VisOptions | None = None,
+        viewer_options: ViewerOptions | None = None,
+        profiling_options: ProfilingOptions | None = None,
+        renderer: RendererOptions | None = None,
+        use_visualizer: bool = True,
+        show_viewer: bool | None = None,
+        show_FPS: bool | None = None,  # deprecated, use profiling_options.show_FPS instead
     ):
-        self._uid = gs.UID()
-        self._t = 0
-        self._is_built = False
-        self._show_FPS = show_FPS
+        # Handling of default arguments
+        sim_options = sim_options or SimOptions()
+        coupler_options = coupler_options or LegacyCouplerOptions()
+        tool_options = tool_options or ToolOptions()
+        rigid_options = rigid_options or RigidOptions()
+        avatar_options = avatar_options or AvatarOptions()
+        mpm_options = mpm_options or MPMOptions()
+        sph_options = sph_options or SPHOptions()
+        fem_options = fem_options or FEMOptions()
+        sf_options = sf_options or SFOptions()
+        pbd_options = pbd_options or PBDOptions()
+        vis_options = vis_options or VisOptions()
+        viewer_options = viewer_options or ViewerOptions()
+        profiling_options = profiling_options or ProfilingOptions()
+        renderer = renderer or Rasterizer()
+
+        if show_FPS is not None:
+            warn_once("Scene.show_FPS is deprecated. Please use Scene.profiling_options.show_FPS")
+            profiling_options.show_FPS = show_FPS
 
         # validate options
         self._validate_options(
@@ -102,6 +136,7 @@ class Scene(RBC):
             pbd_options,
             vis_options,
             viewer_options,
+            profiling_options,
             renderer,
         )
 
@@ -115,9 +150,11 @@ class Scene(RBC):
         self.fem_options = fem_options
         self.sf_options = sf_options
         self.pbd_options = pbd_options
+        self.profiling_options = profiling_options
 
         self.vis_options = vis_options
         self.viewer_options = viewer_options
+        self.renderer_options = renderer
 
         # merge options
         self.tool_options.copy_attributes_from(self.sim_options)
@@ -162,29 +199,34 @@ class Scene(RBC):
         self._backward_ready = False
         self._forward_ready = False
 
+        self._uid = gs.UID()
+        self._t = 0
+        self._is_built = False
+
         gs.logger.info(f"Scene ~~~<{self._uid}>~~~ created.")
 
     def _validate_options(
         self,
-        sim_options,
-        coupler_options,
-        tool_options,
-        rigid_options,
-        avatar_options,
-        mpm_options,
-        sph_options,
-        fem_options,
-        sf_options,
-        pbd_options,
-        vis_options,
-        viewer_options,
-        renderer,
+        sim_options: SimOptions,
+        coupler_options: BaseCouplerOptions,
+        tool_options: ToolOptions,
+        rigid_options: RigidOptions,
+        avatar_options: AvatarOptions,
+        mpm_options: MPMOptions,
+        sph_options: SPHOptions,
+        fem_options: FEMOptions,
+        sf_options: SFOptions,
+        pbd_options: PBDOptions,
+        vis_options: VisOptions,
+        viewer_options: ViewerOptions,
+        profiling_options: ProfilingOptions,
+        renderer_options: RendererOptions,
     ):
         if not isinstance(sim_options, SimOptions):
             gs.raise_exception("`sim_options` should be an instance of `SimOptions`.")
 
-        if not isinstance(coupler_options, CouplerOptions):
-            gs.raise_exception("`coupler_options` should be an instance of `CouplerOptions`.")
+        if not isinstance(coupler_options, BaseCouplerOptions):
+            gs.raise_exception("`coupler_options` should be an instance of `BaseCouplerOptions`.")
 
         if not isinstance(tool_options, ToolOptions):
             gs.raise_exception("`tool_options` should be an instance of `ToolOptions`.")
@@ -216,17 +258,20 @@ class Scene(RBC):
         if not isinstance(viewer_options, ViewerOptions):
             gs.raise_exception("`viewer_options` should be an instance of `ViewerOptions`.")
 
-        if not isinstance(renderer, Renderer):
+        if not isinstance(profiling_options, ProfilingOptions):
+            gs.raise_exception("`profiling_options` should be an instance of `ProfilingOptions`.")
+
+        if not isinstance(renderer_options, RendererOptions):
             gs.raise_exception("`renderer` should be an instance of `gs.renderers.Renderer`.")
 
     @gs.assert_unbuilt
     def add_entity(
         self,
-        morph,
-        material=None,
-        surface=None,
-        visualize_contact=False,
-        vis_mode=None,
+        morph: Morph,
+        material: Material | None = None,
+        surface: Surface | None = None,
+        visualize_contact: bool = False,
+        vis_mode: str | None = None,
     ):
         """
         Add an entity to the scene.
@@ -253,9 +298,8 @@ class Scene(RBC):
             material = gs.materials.Rigid()
 
         if surface is None:
-            surface = (
-                gs.surfaces.Default()
-            )  # assign a local surface, otherwise modification will apply on global default surface
+            # assign a local surface, otherwise modification will apply on global default surface
+            surface = gs.surfaces.Default()
 
         if isinstance(material, gs.materials.Rigid):
             # small sdf res is sufficient for primitives regardless of size
@@ -346,19 +390,11 @@ class Scene(RBC):
         else:
             gs.raise_exception()
 
-        # Rigid entities will convexify geom by default
-        if hasattr(morph, "convexify") and morph.convexify is None:
-            if isinstance(material, (gs.materials.Rigid, gs.materials.Avatar)):
-                morph.convexify = True
-            else:
-                morph.convexify = False
-
-        # Rigid entities will decompose nonconvex geom by default
-        if hasattr(morph, "decompose_nonconvex") and morph.decompose_nonconvex is None:
-            if isinstance(material, (gs.materials.Rigid, gs.materials.Avatar)):
-                morph.decompose_nonconvex = True
-            else:
-                morph.decompose_nonconvex = False
+        # Set material-dependent default options
+        if isinstance(morph, gs.morphs.FileMorph):
+            # Rigid entities will convexify geom by default
+            if morph.convexify is None:
+                morph.convexify = isinstance(material, (gs.materials.Rigid, gs.materials.Avatar))
 
         entity = self._sim._add_entity(morph, material, surface, visualize_contact)
 
@@ -367,8 +403,8 @@ class Scene(RBC):
     @gs.assert_unbuilt
     def link_entities(
         self,
-        parent_entity,
-        child_entity,
+        parent_entity: Entity,
+        child_entity: Entity,
         parent_link_name="",
         child_link_name="",
     ):
@@ -402,7 +438,8 @@ class Scene(RBC):
 
         if child_link._parent_idx != -1:
             gs.logger.warning(
-                "Child entity already has a parent link. This may cause the entity to break into parts. Make sure this operation is intended."
+                "Child entity already has a parent link. This may cause the entity to break into parts. Make sure "
+                "this operation is intended."
             )
         child_link._parent_idx = parent_link.idx
         parent_link._child_idxs.append(child_link.idx)
@@ -410,42 +447,75 @@ class Scene(RBC):
     @gs.assert_unbuilt
     def add_light(
         self,
-        morph,
-        color=(1.0, 1.0, 1.0, 1.0),
-        intensity=20.0,
-        revert_dir=False,
-        double_sided=False,
-        beam_angle=180.0,
+        *,
+        morph: Morph | None = None,
+        color: ArrayLike | None = (1.0, 1.0, 1.0, 1.0),
+        intensity: float = 20.0,
+        revert_dir: bool | None = False,
+        double_sided: bool | None = False,
+        beam_angle: float | None = 180.0,
+        pos: ArrayLike | None = None,
+        dir: ArrayLike | None = None,
+        directional: bool | None = None,
+        castshadow: bool | None = None,
+        cutoff: float | None = None,
     ):
         """
-        Add a light to the scene. Note that lights added this way can be instantiated from morphs (supporting `gs.morphs.Primitive` or `gs.morphs.Mesh`), and will only be used by the RayTracer renderer.
+        Add a light to the scene.
+
+        Warning
+        -------
+        The signature of this method is different depending on the renderer being used, i.e.:
+        - RayTracer: 'add_light(self, morph, color, intensity, revert_dir, double_sided, beam_angle)'
+        - BatchRender: 'add_ligth(self, pos, dir, intensity, directional, castshadow, cutoff)'
+        - Rasterizer: **Unsupported**
 
         Parameters
         ----------
         morph : gs.morphs.Morph
-            The morph of the light. Must be an instance of `gs.morphs.Primitive` or `gs.morphs.Mesh`.
+            The morph of the light. Must be an instance of `gs.morphs.Primitive` or `gs.morphs.Mesh`. Only supported by
+            RayTracer.
         color : tuple of float, shape (3,)
-            The color of the light, specified as (r, g, b).
+            The color of the light, specified as (r, g, b). Only supported by RayTracer.
         intensity : float
             The intensity of the light.
         revert_dir : bool
             Whether to revert the direction of the light. If True, the light will be emitted towards the mesh's inside.
+            Only supported by RayTracer.
         double_sided : bool
-            Whether to emit light from both sides of surface.
+            Whether to emit light from both sides of surface. Only supported by RayTracer.
         beam_angle : float
-            The beam angle of the light.
+            The beam angle of the light. Only supported by RayTracer.
+        pos : tuple of float, shape (3,)
+            The position of the light, specified as (x, y, z). Only supported by BatchRenderer.
+        dir : tuple of float, shape (3,)
+            The direction of the light, specified as (x, y, z). Only supported by BatchRenderer.
+        intensity : float
+            The intensity of the light. Only supported by BatchRenderer.
+        directional : bool
+            Whether the light is directional. Only supported by BatchRenderer.
+        castshadow : bool
+            Whether the light casts shadows. Only supported by BatchRenderer.
+        cutoff : float
+            The cutoff angle of the light in degrees. Only supported by BatchRenderer.
         """
-        if self.visualizer.raytracer is None:
-            gs.logger.warning("Light is only supported by RayTracer renderer.")
-            return
+        if self._visualizer.batch_renderer is not None:
+            if any(map(lambda e: e is None, (pos, dir, intensity, directional, castshadow, cutoff))):
+                gs.raise_exception("Input arguments do not complain with expected signature when using 'BatchRenderer'")
 
-        if not isinstance(morph, (gs.morphs.Primitive, gs.morphs.Mesh)):
-            gs.raise_exception("Light morph only supports `gs.morphs.Primitive` or `gs.morphs.Mesh`.")
+            self.visualizer.add_light(pos, dir, intensity, directional, castshadow, cutoff)
+        elif self.visualizer.raytracer is not None:
+            if any(map(lambda e: e is None, (morph, color, intensity, revert_dir, double_sided, beam_angle))):
+                gs.raise_exception("Input arguments do not complain with expected signature when using 'RayTracer'")
+            if not isinstance(morph, (gs.morphs.Primitive, gs.morphs.Mesh)):
+                gs.raise_exception("Light morph only supports `gs.morphs.Primitive` or `gs.morphs.Mesh`.")
 
-        mesh = gs.Mesh.from_morph_surface(morph, gs.surfaces.Plastic(smooth=False))
-        self.visualizer.raytracer.add_mesh_light(
-            mesh, color, intensity, morph.pos, morph.quat, revert_dir, double_sided, beam_angle
-        )
+            mesh = gs.Mesh.from_morph_surface(morph, gs.surfaces.Plastic(smooth=False))
+            self.visualizer.raytracer.add_mesh_light(
+                mesh, color, intensity, morph.pos, morph.quat, revert_dir, double_sided, beam_angle
+            )
+        else:
+            gs.raise_exception("Adding lights is only supported by 'RayTracer' and 'BatchRenderer'.")
 
     @gs.assert_unbuilt
     def add_camera(
@@ -461,9 +531,18 @@ class Scene(RBC):
         GUI=False,
         spp=256,
         denoise=True,
+        env_idx=None,
     ):
         """
-        Add a camera to the scene. The camera model can be either 'pinhole' or 'thinlens'. The 'pinhole' model is a simple camera model that captures light rays from a single point in space. The 'thinlens' model is a more complex camera model that simulates a lens with a finite aperture size, allowing for depth of field effects. When 'pinhole' is used, the `aperture` and `focal_len` parameters are ignored.
+        Add a camera to the scene.
+
+        The camera model can be either 'pinhole' or 'thinlens'. The 'pinhole' model is a simple camera model that
+        captures light rays from a single point in space. The 'thinlens' model is a more complex camera model that
+        simulates a lens with a finite aperture size, allowing for depth of field effects.
+
+        Warning
+        -------
+        When 'pinhole' is used, the `aperture` and `focal_len` parameters are ignored.
 
         Parameters
         ----------
@@ -486,9 +565,11 @@ class Scene(RBC):
         GUI : bool
             Whether to display the camera's rendered image in a separate GUI window.
         spp : int, optional
-            Samples per pixel. Defaults to 256.
+            Samples per pixel. Only available when using RayTracer renderer. Defaults to 256.
         denoise : bool
-            Whether to denoise the camera's rendered image.
+            Whether to denoise the camera's rendered image. Only available when using the RayTracer renderer. Defaults
+            to True. If OptiX denoiser is not available in your platform, consider enabling the OIDN denoiser option
+            when building the RayTracer.
 
         Returns
         -------
@@ -502,9 +583,9 @@ class Scene(RBC):
     @gs.assert_unbuilt
     def add_emitter(
         self,
-        material,
+        material: Material,
         max_particles=20000,
-        surface=None,
+        surface: Surface | None = None,
     ):
         """
         Add a fluid emitter to the scene.
@@ -548,7 +629,7 @@ class Scene(RBC):
         return emitter
 
     @gs.assert_unbuilt
-    def add_force_field(self, force_field: gs.force_fields.ForceField):
+    def add_force_field(self, force_field: ForceField):
         """
         Add a force field to the scene.
 
@@ -571,7 +652,7 @@ class Scene(RBC):
         self,
         n_envs=0,
         env_spacing=(0.0, 0.0),
-        n_envs_per_row=None,
+        n_envs_per_row: int | None = None,
         center_envs_at_origin=True,
         compile_kernels=True,
     ):
@@ -595,7 +676,8 @@ class Scene(RBC):
             self._parallelize(n_envs, env_spacing, n_envs_per_row, center_envs_at_origin)
 
             # simulator
-            self._sim.build()
+            with open(os.devnull, "w") as stderr, redirect_libc_stderr(stderr):
+                self._sim.build()
 
             # reset state
             self._reset()
@@ -612,17 +694,17 @@ class Scene(RBC):
             with gs.logger.timer("Building visualizer..."):
                 self._visualizer.build()
 
-        if self._show_FPS:
-            self.FPS_tracker = FPSTracker(self.n_envs)
+        if self.profiling_options.show_FPS:
+            self.FPS_tracker = FPSTracker(self.n_envs, alpha=self.profiling_options.FPS_tracker_alpha)
 
         gs.global_scene_list.add(self)
 
     def _parallelize(
         self,
-        n_envs,
-        env_spacing,
-        n_envs_per_row,
-        center_envs_at_origin,
+        n_envs: int,
+        env_spacing: tuple[float, float],
+        n_envs_per_row: int,
+        center_envs_at_origin: bool,
     ):
         self.n_envs = n_envs
         self.env_spacing = env_spacing
@@ -638,13 +720,10 @@ class Scene(RBC):
         # compute offset values for visualizing each env
         if not isinstance(env_spacing, (list, tuple)) or len(env_spacing) != 2:
             gs.raise_exception("`env_spacing` should be a tuple of length 2.")
-        idx_x = np.floor(np.arange(self._B) / self.n_envs_per_row)
-        idx_y = np.arange(self._B) % self.n_envs_per_row
-        idx_z = np.arange(self._B)
-        offset_x = idx_x * self.env_spacing[0]
-        offset_y = idx_y * self.env_spacing[1]
-        offset_z = idx_z * 0.0
-        self.envs_offset = np.vstack([offset_x, offset_y, offset_z]).T
+        offset_x = (np.arange(self._B) // self.n_envs_per_row) * self.env_spacing[0]
+        offset_y = (np.arange(self._B) % self.n_envs_per_row) * self.env_spacing[1]
+        offset_z = np.zeros((self._B,))
+        self.envs_offset = np.stack((offset_x, offset_y, offset_z), axis=-1, dtype=gs.np_float)
 
         # move to center
         if center_envs_at_origin:
@@ -668,25 +747,29 @@ class Scene(RBC):
             self._para_level = gs.PARA_LEVEL.ALL
 
     @gs.assert_built
-    def reset(self, state=None):
+    def reset(self, state: SimState | None = None, envs_idx=None):
         """
         Resets the scene to its initial state.
 
         Parameters
         ----------
-        state : dict | None
-            The state to reset the scene to. If None, the scene will be reset to its initial state. If this is given, the scene's registerered initial state will be updated to this state.
+        state : SimState | None
+            The state to reset the scene to. If None, the scene will be reset to its initial state.
+            If this is given, the scene's registerered initial state will be updated to this state.
+        envs_idx : None | array_like, optional
+            The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
-        gs.logger.info(f"Resetting Scene ~~~<{self._uid}>~~~.")
-        self._reset(state)
+        gs.logger.debug(f"Resetting Scene ~~~<{self._uid}>~~~.")
+        self._reset(state, envs_idx=envs_idx)
 
-    def _reset(self, state=None):
+    def _reset(self, state: SimState | None = None, *, envs_idx=None):
         if self._is_built:
             if state is None:
                 state = self._init_state
             else:
+                assert isinstance(state, SimState), "state must be a SimState object"
                 self._init_state = state
-            self._sim.reset(state)
+            self._sim.reset(state, envs_idx)
         else:
             self._init_state = self._get_state()
 
@@ -696,6 +779,7 @@ class Scene(RBC):
         if self._use_visualizer:
             self._visualizer.reset()
 
+        # TODO: sets _next_particle = 0; not sure this is env isolation safe
         for emitter in self._emitters:
             emitter.reset()
 
@@ -718,7 +802,7 @@ class Scene(RBC):
         return self._get_state()
 
     @gs.assert_built
-    def step(self, update_visualizer=True):
+    def step(self, update_visualizer=True, refresh_visualizer=True):
         """
         Runs a simulation step forward in time.
         """
@@ -732,7 +816,7 @@ class Scene(RBC):
         if update_visualizer and self._use_visualizer:
             self._visualizer.update(force=False)
 
-        if self._show_FPS:
+        if self.profiling_options.show_FPS:
             self.FPS_tracker.step()
 
     def _step_grad(self):
@@ -811,6 +895,30 @@ class Scene(RBC):
         """
         with self._visualizer.viewer_lock:
             return self._visualizer.context.draw_debug_frame(T, axis_length, origin_size, axis_radius)
+
+    @gs.assert_built
+    def draw_debug_frames(self, Ts, axis_length=1.0, origin_size=0.015, axis_radius=0.01):
+        """
+        Draws 3-axis coordinate frames in the scene for visualization.
+
+        Parameters
+        ----------
+        Ts : array_like, shape (n, 4, 4)
+            The transformation matrices of frames.
+        axis_length : float, optional
+            The length of the axes.
+        origin_size : float, optional
+            The size of the origin point (represented as a sphere).
+        axis_radius : float, optional
+            The radius of the axes (represented as cylinders).
+
+        Returns
+        -------
+        node : genesis.ext.pyrender.mesh.Mesh
+            The created debug object.
+        """
+        with self._visualizer.viewer_lock:
+            return self._visualizer.context.draw_debug_frames(Ts, axis_length, origin_size, axis_radius)
 
     @gs.assert_built
     def draw_debug_mesh(self, mesh, pos=np.zeros(3), T=None):
@@ -931,6 +1039,81 @@ class Scene(RBC):
             return self._visualizer.context.draw_debug_points(poss, colors)
 
     @gs.assert_built
+    def draw_debug_path(self, qposs, entity, link_idx=-1, density=0.3, frame_scaling=1.0):
+        """
+        Draws a planned joint trajectory in the scene for visualization.
+
+        Parameters
+        ----------
+        qposs : array_like, shape (N, M)
+            The joint positions of the planned points.
+            N is the number of configurations (i.e., trajectory points).
+            M is the number of degrees of freedom for the entity (i.e., joint dimensions).
+        entity : gs.engine.entities.RigidEntity
+            The rigid entity whose forward kinematics are used to compute the trajectory path.
+        link_idx : int, optional
+            The link id of the rigid entity to visualize. Defeault is -1.
+        density : float, optional
+            Controls the sampling density of the trajectory points to visualize. Default is 0.3.
+        frame_scaling : float, optional
+            Scaling factor for the visualization frames' size. Affects the length and thickness of the debug frames.
+            Default is 1.0.
+
+        Returns
+        -------
+        node : genesis.ext.pyrender.mesh.Mesh
+            The created debug object representing the visualized trajectory.
+
+        Notes
+        -----
+        The function uses forward kinematics (FK) to convert joint positions to Cartesian space and render debug frames.
+        The density parameter reduces FK computational load by sampling fewer points, with 1.0 representing the whole
+        trajectory.
+        """
+        with self._visualizer.viewer_lock:
+            N = len(qposs)
+            density = np.clip(density, 0.0, 1.0)
+            N_new = int(N * density)
+            indices = torch.linspace(0, N - 2, N_new, dtype=int)
+
+            Ts = np.zeros((N_new, 4, 4))
+            for i in range(N_new):
+                pos, quat = entity.forward_kinematics(qposs[indices[i]])
+                Ts[i] = tensor_to_array(gu.trans_quat_to_T(pos[link_idx], quat[link_idx]))
+
+            return self._visualizer.context.draw_debug_frames(
+                Ts, axis_length=frame_scaling * 0.1, origin_size=0.001, axis_radius=frame_scaling * 0.005
+            )
+
+    @gs.assert_built
+    def render_all_cameras(self, rgb=True, depth=False, normal=False, segmentation=False, force_render=False):
+        """
+        Render the scene for all cameras using the batch renderer.
+
+        Parameters
+        ----------
+        rgb : bool, optional
+            Whether to render the rgb image.
+        depth : bool, optional
+            Whether to render the depth image.
+        normal : bool, optional
+            Whether to render the normal image.
+        segmentation : bool, optional
+            Whether to render the segmentation image.
+        force_render : bool, optional
+            Whether to force render the scene.
+
+        Returns:
+            A tuple of tensors of shape (n_envs, H, W, 3) if rgb is not None,
+            otherwise a list of tensors of shape (n_envs, H, W, 1) if depth is not None.
+            If n_envs == 0, the first dimension of the tensor is squeezed.
+        """
+        if self._visualizer.batch_renderer is None:
+            gs.raise_exception("Method only supported by 'BatchRenderer'")
+
+        return self._visualizer.batch_renderer.render(rgb, depth, normal, segmentation, force_render)
+
+    @gs.assert_built
     def clear_debug_object(self, object):
         """
         Clears all the debug objects in the scene.
@@ -961,6 +1144,104 @@ class Scene(RBC):
 
         self._backward_ready = False
         self._forward_ready = False
+
+    def dump_ckpt_to_numpy(self) -> dict[str, np.ndarray]:
+        """
+        Collect every Taichi field in the **scene and its active solvers** and
+        return them as a flat ``{key: ndarray}`` dictionary.
+
+        Returns
+        -------
+        dict[str, np.ndarray]
+            Mapping ``"Class.attr[.member]" → array`` with raw field data.
+        """
+        arrays: dict[str, np.ndarray] = {}
+
+        for name, field in self.__dict__.items():
+            if isinstance(field, ti.Field):
+                arrays[".".join((self.__class__.__name__, name))] = field.to_numpy()
+
+        for solver in self.active_solvers:
+            arrays.update(solver.dump_ckpt_to_numpy())
+
+        return arrays
+
+    def save_checkpoint(self, path: str | os.PathLike) -> None:
+        """
+        Pickle the full physics state to *one* file.
+
+        Parameters
+        ----------
+        path : str | os.PathLike
+            Destination filename.
+        """
+        state = {
+            "timestamp": time.time(),
+            "step_index": self.t,
+            "arrays": self.dump_ckpt_to_numpy(),
+        }
+        with open(path, "wb") as f:
+            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def load_checkpoint(self, path: str | os.PathLike) -> None:
+        """
+        Restore a file produced by :py:meth:`save_checkpoint`.
+
+        Parameters
+        ----------
+        path : str | os.PathLike
+            Path to the checkpoint pickle.
+        """
+        with open(path, "rb") as f:
+            state = pickle.load(f)
+
+        arrays = state["arrays"]
+
+        for name, field in self.__dict__.items():
+            if isinstance(field, ti.Field):
+                key = ".".join((self.__class__.__name__, name))
+                if key in arrays:
+                    field.from_numpy(arrays[key])
+
+        for solver in self.active_solvers:
+            solver.load_ckpt_from_numpy(arrays)
+
+        self._t = state.get("step_index", self._t)
+
+    # ------------------------------------------------------------------------------------
+    # ----------------------------------- utilities --------------------------------------
+    # ------------------------------------------------------------------------------------
+
+    def _sanitize_envs_idx(self, envs_idx, *, unsafe=False):
+        # Handling default argument and special cases
+        if envs_idx is None:
+            return self._envs_idx
+
+        if self.n_envs == 0:
+            gs.raise_exception("`envs_idx` is not supported for non-parallelized scene.")
+
+        if isinstance(envs_idx, slice):
+            return self._envs_idx[envs_idx]
+        if isinstance(envs_idx, (int, np.integer)):
+            return self._envs_idx[envs_idx : envs_idx + 1]
+
+        # Early return if unsafe
+        if unsafe:
+            return envs_idx
+
+        # Perform a bunch of sanity checks
+        _envs_idx = torch.as_tensor(envs_idx, dtype=gs.tc_int, device=gs.device).contiguous()
+        if _envs_idx is not envs_idx:
+            gs.logger.debug(ALLOCATE_TENSOR_WARNING)
+        _envs_idx = torch.atleast_1d(_envs_idx)
+
+        if _envs_idx.ndim != 1:
+            gs.raise_exception("Expecting a 1D tensor for `envs_idx`.")
+
+        if (_envs_idx < 0).any() or (_envs_idx >= self.n_envs).any():
+            gs.raise_exception("`envs_idx` exceeds valid range.")
+
+        return _envs_idx
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------
@@ -999,7 +1280,8 @@ class Scene(RBC):
     @property
     def show_FPS(self):
         """Whether to print the frames per second (FPS) in the terminal."""
-        return self._show_FPS
+        warn_once("Scene.show_FPS is deprecated. Please use profiling_options.show_FPS")
+        return self.profiling_options.show_FPS
 
     @property
     def gravity(self):
@@ -1037,7 +1319,7 @@ class Scene(RBC):
         return self._sim.active_solvers
 
     @property
-    def entities(self):
+    def entities(self) -> list[Entity]:
         """All the entities in the scene."""
         return self._sim.entities
 

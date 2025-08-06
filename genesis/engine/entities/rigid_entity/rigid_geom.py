@@ -1,18 +1,25 @@
 import os
 import pickle as pkl
+from typing import TYPE_CHECKING
 
 import igl
 import numpy as np
 import skimage
 import taichi as ti
 import torch
+import trimesh
 
 import genesis as gs
 import genesis.utils.geom as gu
 import genesis.utils.mesh as mu
-from genesis.ext import trimesh
 from genesis.repr_base import RBC
 from genesis.utils.misc import tensor_to_array
+
+if TYPE_CHECKING:
+    from genesis.engine.materials.rigid import Rigid as RigidMaterial
+
+    from .rigid_entity import RigidEntity
+    from .rigid_link import RigidLink
 
 
 @ti.data_oriented
@@ -23,12 +30,13 @@ class RigidGeom(RBC):
 
     def __init__(
         self,
-        link,
+        link: "RigidLink",
         idx,
         cell_start,
         vert_start,
         face_start,
         edge_start,
+        verts_state_start,
         mesh,
         type,
         friction,
@@ -36,12 +44,14 @@ class RigidGeom(RBC):
         init_pos,
         init_quat,
         needs_coup,
+        contype,
+        conaffinity,
         center_init=None,
         data=None,
     ):
-        self._link = link
-        self._entity = link.entity
-        self._material = link.entity.material
+        self._link: "RigidLink" = link
+        self._entity: "RigidEntity" = link.entity
+        self._material: "RigidMaterial" = link.entity.material
         self._solver = link.entity.solver
         self._mesh = mesh
 
@@ -51,11 +61,14 @@ class RigidGeom(RBC):
         self._friction = friction
         self._sol_params = sol_params
         self._needs_coup = needs_coup
+        self._contype = contype
+        self._conaffinity = conaffinity
         self._is_convex = mesh.is_convex
         self._cell_start = cell_start
         self._vert_start = vert_start
         self._face_start = face_start
         self._edge_start = edge_start
+        self._verts_state_start = verts_state_start
 
         self._coup_softness = self._material.coup_softness
         self._coup_friction = self._material.coup_friction
@@ -90,6 +103,14 @@ class RigidGeom(RBC):
             self._sdf_verts = np.array(self._init_verts)
             self._sdf_faces = np.array(self._init_faces)
 
+        if len(self._sdf_faces) > 50000:
+            mesh_descr = f"({mesh.metadata['mesh_path']})" if "mesh_path" in mesh.metadata else ""
+            gs.logger.warning(
+                "Beware that SDF pre-processing of mesh {mesh_descr} having more than 50000 vertices may take a very "
+                "long time (>10min) and require large RAM allocation (>20Gb). Please either enable convexify or "
+                "decimation. (see FileMorph options)"
+            )
+
         # collision mesh uses default color
         self._preprocess()
 
@@ -98,7 +119,6 @@ class RigidGeom(RBC):
 
     def _preprocess(self):
         # compute file name via hashing for caching
-
         self._gsd_path = mu.get_gsd_path(
             self._init_verts,
             self._init_faces,
@@ -107,7 +127,18 @@ class RigidGeom(RBC):
             self._material.sdf_max_res,
         )
 
-        if not os.path.exists(self._gsd_path):
+        # loading pre-computed cache if available
+        is_cached_loaded = False
+        if os.path.exists(self._gsd_path):
+            gs.logger.debug(f"Preprocessed file (`.gsd`) found in cache for geom idx {self._idx}.")
+            try:
+                with open(self._gsd_path, "rb") as file:
+                    gsd_dict = pkl.load(file)
+                is_cached_loaded = True
+            except (EOFError, ModuleNotFoundError, pkl.UnpicklingError):
+                gs.logger.info("Ignoring corrupted cache.")
+
+        if not is_cached_loaded:
             with gs.logger.timer(f"Preprocessing geom idx ~~<{self._idx}>~~."):
                 ######## sdf ########
                 lower = self._init_verts.min(axis=0)
@@ -115,20 +146,15 @@ class RigidGeom(RBC):
                 center = (upper + lower) / 2.0
 
                 # NOTE: sdf size is from the center of the lower voxel cell to the center of the upper voxel cell
-                # add padding
+                # add padding. Adjust the cell size to keep resolution within bounds.
                 padding_ratio = 0.2
                 grid_size = (upper - lower).max() * padding_ratio + (upper - lower)
-                sdf_res = np.ceil(grid_size / self._material.sdf_cell_size).astype(int) + 1
-
-                if sdf_res.max() > self._material.sdf_max_res:
-                    sdf_res = np.ceil(sdf_res * self._material.sdf_max_res / sdf_res.max()).astype(int)
-                    sdf_cell_size = grid_size.max() / (sdf_res.max() - 1)
-                elif sdf_res.max() < self._material.sdf_min_res:
-                    sdf_res = np.ceil(sdf_res * self._material.sdf_min_res / sdf_res.max()).astype(int)
-                    sdf_cell_size = grid_size.max() / (sdf_res.max() - 1)
-                else:
-                    sdf_cell_size = self._material.sdf_cell_size
-                sdf_res = np.clip(sdf_res, 3, None)
+                sdf_cell_size = gs.EPS + np.clip(
+                    self._material.sdf_cell_size,
+                    grid_size.max() / (self._material.sdf_max_res - 1),
+                    grid_size.min() / max(self._material.sdf_min_res - 1, 2),
+                )
+                sdf_res = np.ceil(grid_size / sdf_cell_size).astype(gs.np_int) + 1
 
                 # round up to multiple of sdf_cell_size
                 grid_size = (sdf_res - 1) * sdf_cell_size
@@ -184,7 +210,7 @@ class RigidGeom(RBC):
                 vert_n_neighbors = np.array(vert_n_neighbors)
                 vert_neighbor_start = np.array(vert_neighbor_start)
 
-                # compile
+                # caching
                 gsd_dict = {
                     "sdf_res": sdf_res,
                     "sdf_val": sdf_val,
@@ -201,11 +227,6 @@ class RigidGeom(RBC):
                 os.makedirs(os.path.dirname(self._gsd_path), exist_ok=True)
                 with open(self._gsd_path, "wb") as file:
                     pkl.dump(gsd_dict, file)
-        else:
-            gs.logger.debug(f"Preprocessed `.gsd` file found in cache for geom idx {self._idx}.")
-
-            with open(self._gsd_path, "rb") as file:
-                gsd_dict = pkl.load(file)
 
         self._sdf_res = gsd_dict["sdf_res"]
         self._sdf_val = gsd_dict["sdf_val"]
@@ -221,14 +242,14 @@ class RigidGeom(RBC):
         self.vert_neighbor_start = gsd_dict["vert_neighbor_start"]
 
     def _compute_sd(self, query_points):
-        sd, _, _ = igl.signed_distance(query_points, self._sdf_verts, self._sdf_faces)
-        return sd
+        signed_distance, *_ = igl.signed_distance(query_points, self._sdf_verts, self._sdf_faces)
+        return signed_distance.astype(gs.np_float, copy=False)
 
     def _compute_closest_verts(self, query_points):
-        _, closest_faces, _ = igl.signed_distance(query_points, self._init_verts, self._init_faces)
+        _, closest_faces, *_ = igl.signed_distance(query_points, self._init_verts, self._init_faces)
         verts_ids = self._init_faces[closest_faces]
         verts_ids = verts_ids[
-            np.arange(len(query_points)).astype(int),
+            np.arange(len(query_points), dtype=gs.np_int),
             np.argmin(np.linalg.norm(self._init_verts[verts_ids] - query_points[:, None, :], axis=-1), axis=-1),
         ]
         return verts_ids
@@ -315,96 +336,9 @@ class RigidGeom(RBC):
             )
             self._solver.scene.draw_debug_mesh(boundary_mesh, T=T)
 
-    def sdf_grad_world(self, pos_world, recompute=False):
-        """
-        sdf grad wrt world frame coordinate.
-        """
-        pos_mesh = gu.inv_transform_by_trans_quat(pos_world, self.get_pos(), self.get_quat())
-        grad_mesh = self.sdf_grad_mesh(pos_mesh, recompute)
-        grad_world = gu.transform_by_quat(grad_mesh, self.get_quat())
-        return grad_world
-
-    def sdf_grad_mesh(self, pos_mesh, recompute=False):
-        """
-        sdf grad wrt mesh frame coordinate.
-        """
-        if recompute:
-            grad_mesh = self._compute_sd_grad(np.array([pos_mesh]), self.sdf_grad_delta)
-
-        else:
-            pos_sdf = gu.transform_by_T(pos_mesh, self.T_mesh_to_sdf)
-            grad_sdf = self.sdf_grad_sdf(pos_sdf)
-            grad_mesh = grad_sdf  # no rotation between mesh and sdf frame
-
-        return grad_mesh
-
-    def sdf_grad_sdf(self, pos_sdf):
-        """
-        sdf grad wrt sdf frame coordinate.
-        """
-        base = np.floor(pos_sdf)
-        res = self.sdf_res
-
-        if (base >= res - 1).any() or (base < 0).any():
-            grad_sdf = np.array([np.nan, np.nan, np.nan])
-
-        else:
-            grad_sdf = np.zeros(3)
-            for i in range(2):
-                for j in range(2):
-                    for k in range(2):
-                        offset = np.array([i, j, k])
-                        voxel_pos = (base + offset).astype(int)
-                        w_xyz = 1 - np.abs(pos_sdf - voxel_pos)
-                        w = w_xyz[0] * w_xyz[1] * w_xyz[2]
-                        grad_sdf += w * self.sdf_grad[voxel_pos[0], voxel_pos[1], voxel_pos[2]]
-
-        return grad_sdf
-
-    def sdf_world(self, pos_world, recompute=False):
-        """
-        sdf value from world coordinate
-        """
-        pos_mesh = gu.inv_transform_by_trans_quat(pos_world, self.get_pos(), self.get_quat())
-        return self.sdf_mesh(pos_mesh, recompute)
-
-    def sdf_mesh(self, pos_mesh, recompute=False):
-        """
-        sdf value from mesh coordinate
-        """
-        if recompute:
-            return self._compute_sd(np.array([pos_mesh]))
-        else:
-            pos_sdf = gu.transform_by_T(pos_mesh, self.T_mesh_to_sdf)
-            return self.sdf_sdf(pos_sdf)
-
-    def sdf_sdf(self, pos_sdf):
-        """
-        sdf value wrt sdf frame coordinate.
-        Note that the stored sdf magnitude is already w.r.t world frame.
-        """
-        base = np.floor(pos_sdf)
-        res = self.sdf_res
-
-        if (base >= res - 1).any() or (base < 0).any():
-            signed_dist = np.inf
-
-        else:
-            signed_dist = 0.0
-            for i in range(2):
-                for j in range(2):
-                    for k in range(2):
-                        offset = np.array([i, j, k])
-                        voxel_pos = (base + offset).astype(int)
-                        w_xyz = 1 - np.abs(pos_sdf - voxel_pos)
-                        w = w_xyz[0] * w_xyz[1] * w_xyz[2]
-                        signed_dist += w * self.sdf_val[voxel_pos[0], voxel_pos[1], voxel_pos[2]]
-
-        return signed_dist
-
     def set_friction(self, friction):
         """
-        Set the friction coefficient of the geom.
+        Set the friction coefficient of this geometry.
         """
         if friction < 0:
             gs.raise_exception("`friction` must be non-negative.")
@@ -430,8 +364,8 @@ class RigidGeom(RBC):
 
     @ti.kernel
     def _kernel_get_pos(self, tensor: ti.types.ndarray()):
-        for i, b in ti.ndrange(3, self._solver._B):
-            tensor[b, i] = self._solver.geoms_state[self._idx, b].pos[i]
+        for i, i_b in ti.ndrange(3, self._solver._B):
+            tensor[i_b, i] = self._solver.geoms_state.pos[self._idx, i_b][i]
 
     @gs.assert_built
     def get_quat(self):
@@ -446,28 +380,38 @@ class RigidGeom(RBC):
 
     @ti.kernel
     def _kernel_get_quat(self, tensor: ti.types.ndarray()):
-        for i, b in ti.ndrange(4, self._solver._B):
-            tensor[b, i] = self._solver.geoms_state[self._idx, b].quat[i]
+        for i, i_b in ti.ndrange(4, self._solver._B):
+            tensor[i_b, i] = self._solver.geoms_state.quat[self._idx, i_b][i]
 
     @gs.assert_built
     def get_verts(self):
         """
         Get the vertices of the geom in world frame.
         """
-        tensor = torch.empty(self._solver._batch_shape((self.n_verts, 3), True), dtype=gs.tc_float, device=gs.device)
-        self._kernel_get_verts(tensor)
-        if self._solver.n_envs == 0:
-            tensor = tensor.squeeze(0)
+        self._solver.update_verts_for_geom(self._idx)
+        if self.is_free:
+            tensor = torch.empty(
+                self._solver._batch_shape((self.n_verts, 3), True), dtype=gs.tc_float, device=gs.device
+            )
+            self._kernel_get_free_verts(tensor)
+            if self._solver.n_envs == 0:
+                tensor = tensor.squeeze(0)
+        else:
+            tensor = torch.empty((self.n_verts, 3), dtype=gs.tc_float, device=gs.device)
+            self._kernel_get_fixed_verts(tensor)
         return tensor
 
     @ti.kernel
-    def _kernel_get_verts(self, tensor: ti.types.ndarray()):
-        for b in range(self._solver._B):
-            self._solver._func_update_verts_for_geom(self._idx, b)
+    def _kernel_get_free_verts(self, tensor: ti.types.ndarray()):
+        for i_v, j, i_b in ti.ndrange(self.n_verts, 3, self._solver._B):
+            idx_vert = i_v + self._verts_state_start
+            tensor[i_b, i_v, j] = self._solver.free_verts_state.pos[idx_vert, i_b][j]
 
-        for i, j, b in ti.ndrange(self.n_verts, 3, self._solver._B):
-            idx_vert = i + self._vert_start
-            tensor[b, i, j] = self._solver.verts_state[idx_vert, b].pos[j]
+    @ti.kernel
+    def _kernel_get_fixed_verts(self, tensor: ti.types.ndarray()):
+        for i_v, j in ti.ndrange(self.n_verts, 3):
+            idx_vert = i_v + self._verts_state_start
+            tensor[i_v, j] = self._solver.fixed_verts_state.pos[idx_vert][j]
 
     @gs.assert_built
     def get_AABB(self):
@@ -480,6 +424,24 @@ class RigidGeom(RBC):
             axis=-2,
         )
         return AABB
+
+    def set_sol_params(self, sol_params):
+        """
+        Set the solver parameters of this geometry.
+        """
+        if self.is_built:
+            self._solver.set_sol_params(sol_params[None], geoms_idx=self._idx, envs_idx=None, unsafe=False)
+        else:
+            self._sol_params = sol_params
+
+    @property
+    def sol_params(self):
+        """
+        Get the solver parameters of this geometry.
+        """
+        if self.is_built:
+            return self._solver.get_sol_params(geoms_idx=self._idx, envs_idx=None, unsafe=True)[0]
+        return self._sol_params
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------
@@ -514,13 +476,6 @@ class RigidGeom(RBC):
         return self._friction
 
     @property
-    def sol_params(self):
-        """
-        Get the solver parameters of the geom.
-        """
-        return self._sol_params
-
-    @property
     def data(self):
         """
         Get the additional data of the geom.
@@ -535,14 +490,14 @@ class RigidGeom(RBC):
         return self._metadata
 
     @property
-    def link(self):
+    def link(self) -> "RigidLink":
         """
         Get the link that the geom belongs to.
         """
         return self._link
 
     @property
-    def entity(self):
+    def entity(self) -> "RigidEntity":
         """
         Get the entity that the geom belongs to.
         """
@@ -572,6 +527,27 @@ class RigidGeom(RBC):
         Get whether the geom needs coupling with other non-rigid entities.
         """
         return self._needs_coup
+
+    @property
+    def contype(self):
+        """
+        Get the contact type of the geometry for collision pair filtering.
+
+        The two geoms are deemed "compatible" (i.e. collisions between them is allowed) if the 'contype' of one geom
+        and the 'conaffinity' of the other geom have a common bit set to 1, i.e.
+        `(geom1.contype & geom2.conaffinity) || (geom2.contype & geom1.conaffinity) == True`. This is a powerful
+        mechanism borrowed from Open Dynamics Engine.
+        """
+        return self._contype
+
+    @property
+    def conaffinity(self):
+        """
+        Get the contact affinity of the geometry for collision pair filtering.
+
+        See `contype` documentation for details.
+        """
+        return self._conaffinity
 
     @property
     def coup_softness(self):
@@ -683,7 +659,7 @@ class RigidGeom(RBC):
         """
         Get the flattened signed distance field (SDF) of the geom.
         """
-        return self._sdf_val.flatten()
+        return self._sdf_val.reshape((-1,))
 
     @property
     def sdf_grad(self):
@@ -732,7 +708,7 @@ class RigidGeom(RBC):
         """
         Get the flattened closest vertex of each cell of the geom's signed distance field (SDF).
         """
-        return self._sdf_closest_vert.flatten()
+        return self._sdf_closest_vert.reshape((-1,))
 
     @property
     def T_mesh_to_sdf(self):
@@ -798,6 +774,13 @@ class RigidGeom(RBC):
         return self._edge_start
 
     @property
+    def verts_state_start(self):
+        """
+        Get the starting index of the geom's vertices in the rigid solver.
+        """
+        return self._verts_state_start
+
+    @property
     def cell_end(self):
         """
         Get the ending index of the cells of the signed distance field (SDF) in the rigid solver.
@@ -810,6 +793,13 @@ class RigidGeom(RBC):
         Get the ending index of the geom's vertices in the rigid solver.
         """
         return self.n_verts + self.vert_start
+
+    @property
+    def verts_state_end(self):
+        """
+        Get the ending index of the geom's vertices in the rigid solver.
+        """
+        return self.n_verts + self.verts_state_start
 
     @property
     def face_end(self):
@@ -831,6 +821,13 @@ class RigidGeom(RBC):
         Whether the rigid entity the geom belongs to is built.
         """
         return self.entity.is_built
+
+    @property
+    def is_free(self):
+        """
+        Whether the rigid entity the vgeom belongs to is free.
+        """
+        return self.entity.is_free
 
     # ------------------------------------------------------------------------------------
     # -------------------------------------- repr ----------------------------------------
@@ -877,6 +874,7 @@ class RigidVisGeom(RBC):
         self._uvs = vmesh.uvs
         self._surface = vmesh.surface
         self._metadata = vmesh.metadata
+        self._color = vmesh._color
 
     def _build(self):
         pass
@@ -886,6 +884,42 @@ class RigidVisGeom(RBC):
         Get trimesh object.
         """
         return self._vmesh.trimesh
+
+    # ------------------------------------------------------------------------------------
+    # -------------------------------- real-time state -----------------------------------
+    # ------------------------------------------------------------------------------------
+
+    @gs.assert_built
+    def get_pos(self):
+        """
+        Get the position of the geom in world frame.
+        """
+        tensor = torch.empty(self._solver._batch_shape(3, True), dtype=gs.tc_float, device=gs.device)
+        self._kernel_get_pos(tensor)
+        if self._solver.n_envs == 0:
+            tensor = tensor.squeeze(0)
+        return tensor
+
+    @ti.kernel
+    def _kernel_get_pos(self, tensor: ti.types.ndarray()):
+        for i, i_b in ti.ndrange(3, self._solver._B):
+            tensor[i_b, i] = self._solver.vgeoms_state.pos[self._idx, i_b][i]
+
+    @gs.assert_built
+    def get_quat(self):
+        """
+        Get the quaternion of the geom in world frame.
+        """
+        tensor = torch.empty(self._solver._batch_shape(4, True), dtype=gs.tc_float, device=gs.device)
+        self._kernel_get_quat(tensor)
+        if self._solver.n_envs == 0:
+            tensor = tensor.squeeze(0)
+        return tensor
+
+    @ti.kernel
+    def _kernel_get_quat(self, tensor: ti.types.ndarray()):
+        for i, i_b in ti.ndrange(4, self._solver._B):
+            tensor[i_b, i] = self._solver.vgeoms_state.quat[self._idx, i_b][i]
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------
@@ -1034,6 +1068,13 @@ class RigidVisGeom(RBC):
         Whether the rigid entity the vgeom belongs to is built.
         """
         return self.entity.is_built
+
+    @property
+    def is_free(self):
+        """
+        Whether the rigid entity the vgeom belongs to is free.
+        """
+        return self.entity.is_free
 
     # ------------------------------------------------------------------------------------
     # -------------------------------------- repr ----------------------------------------

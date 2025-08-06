@@ -21,24 +21,24 @@ def main():
             camera_fov=40,
         ),
         show_viewer=args.vis,
-        rigid_options=gs.options.RigidOptions(),
     )
 
     ########################## entities ##########################
     tank = scene.add_entity(
         gs.morphs.Mesh(
             file="meshes/tank.obj",
-            convexify=False,
             scale=5.0,
             fixed=True,
             euler=(90, 0, 0),
         ),
+        # vis_mode="collision",
     )
     ball = scene.add_entity(
         gs.morphs.Sphere(
             radius=0.1,
             pos=(0.0, 0.0, 1.0),
         ),
+        # vis_mode="collision",
     )
 
     ########################## build ##########################
