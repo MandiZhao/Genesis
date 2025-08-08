@@ -190,7 +190,7 @@ class Scene(RBC):
                 show_viewer=show_viewer,
                 vis_options=vis_options,
                 viewer_options=viewer_options,
-                renderer=renderer,
+                renderer_options=renderer,
             )
 
         # emitters
@@ -578,7 +578,9 @@ class Scene(RBC):
         """
         if not self._use_visualizer:
             return 
-        return self._visualizer.add_camera(res, pos, lookat, up, model, fov, aperture, focus_dist, GUI, spp, denoise)
+        return self._visualizer.add_camera(
+            res, pos, lookat, up, model, fov, aperture, focus_dist, GUI, spp, denoise, env_idx
+        )
 
     @gs.assert_unbuilt
     def add_emitter(

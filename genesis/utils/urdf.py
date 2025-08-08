@@ -266,12 +266,19 @@ def parse_urdf(morph, surface):
         j_info["sol_params"] = gu.default_solver_params()
         j_info["dofs_kp"] = gu.default_dofs_kp(j_info["n_dofs"])
         j_info["dofs_kv"] = gu.default_dofs_kv(j_info["n_dofs"])
-        j_info["dofs_force_range"] = np.tile([-np.inf, np.inf], (j_info["n_dofs"], 1))
+        # j_info["dofs_force_range"] = np.tile([-np.inf, np.inf], (j_info["n_dofs"], 1)) -> new 
+        j_info["dofs_force_range"] = np.tile([-100.0, 100.0], (j_info["n_dofs"], 1))
 
-        j_info["dofs_damping"] = np.zeros(j_info["n_dofs"])
-        j_info["dofs_armature"] = np.zeros(j_info["n_dofs"])
-        if joint.joint_type not in ("floating", "fixed") and morph.default_armature is not None:
-            j_info["dofs_armature"] = np.full((j_info["n_dofs"],), morph.default_armature)
+        # j_info["dofs_damping"] = np.zeros(j_info["n_dofs"])
+        # j_info["dofs_armature"] = np.zeros(j_info["n_dofs"])
+        # if joint.joint_type not in ("floating", "fixed") and morph.default_armature is not None:
+        #     j_info["dofs_armature"] = np.full((j_info["n_dofs"],), morph.default_armature)
+        if joint.joint_type in ["floating", "fixed"]: # old defaults
+            j_info["dofs_damping"] = np.zeros(j_info["n_dofs"]) 
+            j_info["dofs_armature"] = np.zeros(j_info["n_dofs"]) 
+        else:
+            j_info["dofs_damping"] = np.ones(j_info["n_dofs"])
+            j_info["dofs_armature"] = 0.1 * np.ones(j_info["n_dofs"])
         
         if j_info['name'] == "rotation":
            print('WARNING: Special case for the ARCTIC object joints, set damping to 0.0 and armature to 0.0')
