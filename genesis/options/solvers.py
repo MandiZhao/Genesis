@@ -114,6 +114,11 @@ class SAPCouplerOptions(BaseCouplerOptions):
     """
     Options configuring the inter-solver coupling for the Semi-Analytic Primal (SAP) contact solver used in Drake.
 
+    Note
+    ----
+    Paper reference: https://arxiv.org/abs/2110.10107
+    Drake reference: https://drake.mit.edu/release_notes/v1.5.0.html
+
     Parameters
     ----------
     n_sap_iterations : int, optional
@@ -142,16 +147,16 @@ class SAPCouplerOptions(BaseCouplerOptions):
         Stiffness for hydroelastic contact. Defaults to 1e8.
     point_contact_stiffness : float, optional
         Stiffness for point contact. Defaults to 1e8.
-    fem_floor_type : str, optional
+    fem_floor_contact_type : str, optional
         Type of contact against the floor. Defaults to "tet". Can be "tet", "vert", or "none".
-        Tet would be the default choice for most cases.
-        Vert would be preferable when the mesh is very coarse, such as a single cube or a tetrahedron.
-    fem_self_tet : bool, optional
+        TET would be the default choice for most cases.
+        VERT would be preferable when the mesh is very coarse, such as a single cube or a tetrahedron.
+    enable_fem_self_tet_contact : bool, optional
         Whether to use tetrahedral based self-contact. Defaults to True.
-    Note
-    ----
-    Paper reference: https://arxiv.org/abs/2110.10107
-    Drake reference: https://drake.mit.edu/release_notes/v1.5.0.html
+    rigid_floor_contact_type : str, optional
+        Type of contact against the floor for rigid bodies. Defaults to "vert". Can be "vert" or "none".
+    enable_rigid_fem_contact : bool, optional
+        Whether to enable coupling between rigid and FEM solvers. Defaults to True.
     """
 
     n_sap_iterations: int = 5
@@ -167,8 +172,10 @@ class SAPCouplerOptions(BaseCouplerOptions):
     linesearch_max_step_size: float = 1.5
     hydroelastic_stiffness: float = 1e8
     point_contact_stiffness: float = 1e8
-    fem_floor_type: str = "tet"
-    fem_self_tet: bool = True
+    fem_floor_contact_type: str = "tet"
+    enable_fem_self_tet_contact: bool = True
+    rigid_floor_contact_type: str = "vert"
+    enable_rigid_fem_contact: bool = True
 
 
 ############################ Solvers inside simulator ############################
@@ -241,6 +248,13 @@ class RigidOptions(Options):
         Number of line search iterations for the constraint solver. Defaults to 50.
     ls_tolerance : float, optional
         Tolerance for the line search. Defaults to 1e-2.
+    noslip_iterations : int, optional
+        Number of iterations for the noslip solver. Defaults to 0 (disabled).
+        noslip is a post-processing step after the main solver to suppress slip/drift.
+        Recommended to set this value to 5 for manipulation tasks or when slip/drift is a big problem.
+        This option should only be enabled if necessary because it is experimental and will slow down the simulation.
+    noslip_tolerance : float, optional
+        Tolerance for the noslip solver. Defaults to 1e-6.
     sparse_solve : bool, optional
         Whether to exploit sparsity in the constraint system. Defaults to False.
     contact_resolve_time : float, optional
@@ -290,6 +304,8 @@ class RigidOptions(Options):
     tolerance: float = 1e-8
     ls_iterations: int = 50
     ls_tolerance: float = 1e-2
+    noslip_iterations: int = 0
+    noslip_tolerance: float = 1e-6
     sparse_solve: bool = False
     contact_resolve_time: Optional[float] = None
     constraint_timeconst: float = 0.01
@@ -575,6 +591,13 @@ class FEMOptions(Options):
     """
     Options configuring the FEMSolver.
 
+    Note
+    ----
+    - Damping coefficients are used to control the damping effect in the simulation.
+    They are used in the Rayleigh Damping model, which is a common damping model in FEM simulations.
+    Reference: https://doc.comsol.com/5.5/doc/com.comsol.help.sme/sme_ug_modeling.05.083.html
+    - TODO Move it to material parameters in the future instead of solver options.
+
     Parameters
     ----------
     dt : float, optional
@@ -606,13 +629,8 @@ class FEMOptions(Options):
         Rayleigh Damping factor for the implicit solver. Defaults to 0.5. Only used when `use_implicit_solver` is True.
     damping_beta : float, optional
         Rayleigh Damping factor for the implicit solver. Defaults to 5e-4. Only used when `use_implicit_solver` is True.
-
-    Note
-    ----
-    - Damping coefficients are used to control the damping effect in the simulation.
-    They are used in the Rayleigh Damping model, which is a common damping model in FEM simulations.
-    Reference: https://doc.comsol.com/5.5/doc/com.comsol.help.sme/sme_ug_modeling.05.083.html
-    - TODO Move it to material parameters in the future instead of solver options.
+    enable_vertex_constraints : bool, optional
+        Whether to enable vertex constraints. Defaults to False.
     """
 
     dt: Optional[float] = None
@@ -629,6 +647,7 @@ class FEMOptions(Options):
     linesearch_tau: float = 0.5
     damping_alpha: float = 0.5
     damping_beta: float = 5e-4
+    enable_vertex_constraints: bool = False
 
 
 class SFOptions(Options):
