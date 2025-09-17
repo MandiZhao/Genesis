@@ -2,6 +2,7 @@ import ctypes
 import datetime
 import functools
 import logging
+import math
 import platform
 import random
 import types
@@ -180,23 +181,23 @@ def get_platform():
 
 
 def get_device(backend: gs_backend, device_idx: Optional[int] = None):
-    if backend == gs_backend.cuda:
+    if backend == gs_backend.cpu:
+        device_name = cpuinfo.get_cpu_info()["brand_raw"]
+        total_mem = psutil.virtual_memory().total / 1024**3
+        device = torch.device("cpu", device_idx)
+    elif backend == gs_backend.cuda:
         if not torch.cuda.is_available():
             gs.raise_exception("torch cuda not available")
-
         device = torch.device("cuda", device_idx)
         device_property = torch.cuda.get_device_properties(device)
         device_name = device_property.name
         total_mem = device_property.total_memory / 1024**3
-
     elif backend == gs_backend.metal:
         if not torch.backends.mps.is_available():
             gs.raise_exception("metal device not available")
-
-        # on mac, cpu and gpu are in the same device
+        # on mac, cpu and gpu are in the same physical hardware and sharing memory
         _, device_name, total_mem, _ = get_device(gs_backend.cpu)
         device = torch.device("mps", device_idx)
-
     elif backend == gs_backend.vulkan:
         if torch.cuda.is_available():
             device, device_name, total_mem, _ = get_device(gs_backend.cuda)
@@ -212,19 +213,13 @@ def get_device(backend: gs_backend, device_idx: Optional[int] = None):
             logger = getattr(gs, "logger", None) or LOGGER
             logger.warning("No Intel XPU device available. Falling back to CPU for torch device.")
             device, device_name, total_mem, _ = get_device(gs_backend.cpu)
-
-    elif backend == gs_backend.gpu:
+    else:  # backend == gs_backend.gpu:
         if torch.cuda.is_available():
             return get_device(gs_backend.cuda)
         elif get_platform() == "macOS":
             return get_device(gs_backend.metal)
         else:
             return get_device(gs_backend.vulkan)
-
-    else:
-        device_name = cpuinfo.get_cpu_info()["brand_raw"]
-        total_mem = psutil.virtual_memory().total / 1024**3
-        device = torch.device("cpu", device_idx)
 
     return device, device_name, total_mem, backend
 
@@ -327,35 +322,42 @@ def is_approx_multiple(a, b, tol=1e-7):
     return abs(a % b) < tol or abs(b - (a % b)) < tol
 
 
-def concat_with_tensor(
-    tensor: torch.Tensor, value, expand: tuple[int, ...] | None = None, dtype: torch.dtype | None = None, dim: int = 0
-):
+def concat_with_tensor(tensor: torch.Tensor, value, expand: tuple[int, ...] | None = None, dim: int = 0):
     """Helper method to concatenate a value (not necessarily a tensor) with a tensor."""
     if not isinstance(value, torch.Tensor):
-        value = torch.tensor([value], dtype=dtype or gs.tc_float, device=gs.device)
+        value = torch.tensor([value], dtype=tensor.dtype, device=tensor.device)
     if expand is not None:
         value = value.expand(*expand)
+    if dim < 0:
+        dim = tensor.ndim + dim
+    assert (
+        0 <= dim < tensor.ndim
+        and tensor.ndim == value.ndim
+        and all(e_1 == e_2 for i, (e_1, e_2) in enumerate(zip(tensor.shape, value.shape)) if e_1 > 0 and i != dim)
+    )
     if tensor.numel() == 0:
         return value
     return torch.cat([tensor, value], dim=dim)
 
 
-def make_tensor_field(shape: tuple[int, ...] = (), dtype_factory: Callable[[], torch.dtype] = lambda: gs.tc_float):
+def make_tensor_field(shape: tuple[int, ...] = (), dtype_factory: Callable[[], torch.dtype] | None = None):
     """
     Helper method to create a tensor field for dataclasses.
 
     Parameters
     ----------
     shape : tuple
-        The shape of the tensor field.
+        The shape of the tensor field. It must have zero elements, otherwise it will trigger an exception.
     dtype_factory : Callable[[], torch.dtype], optional
         The factory function to create the dtype of the tensor field. Default is gs.tc_float.
         A factory is used because gs types may not be available at the time of field creation.
     """
+    assert not shape or math.prod(shape) == 0
 
     def _default_factory():
         nonlocal shape, dtype_factory
-        return torch.empty(shape, dtype=dtype_factory(), device=gs.device)
+        dtype = dtype_factory() if dtype_factory is not None else gs.tc_float
+        return torch.empty(shape, dtype=dtype, device=gs.device)
 
     return field(default_factory=_default_factory)
 
