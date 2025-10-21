@@ -13,7 +13,7 @@ import genesis.utils.geom as gu
 from genesis.ext import pyrender
 from genesis.repr_base import RBC
 from genesis.utils.tools import Rate
-from genesis.utils.misc import redirect_libc_stderr
+from genesis.utils.misc import redirect_libc_stderr, tensor_to_array
 
 if TYPE_CHECKING:
     from genesis.options.vis import ViewerOptions
@@ -41,6 +41,10 @@ class Viewer(RBC):
         self._camera_up = np.asarray(options.camera_up, dtype=gs.np_float)
         self._camera_fov = options.camera_fov
         self._enable_interaction = options.enable_interaction
+
+        # Validate viewer options
+        if any(e.shape != (3,) for e in (self._camera_init_pos, self._camera_init_lookat, self._camera_up)):
+            gs.raise_exception("ViewerOptions.camera_(pos|lookat|up) must be sequences of length 3.")
 
         if options.enable_interaction and gs.backend != gs.cpu:
             gs.logger.warning("Interaction code is slow on GPU. Switch to CPU backend or disable interaction.")
@@ -74,8 +78,8 @@ class Viewer(RBC):
             else:
                 all_opengl_platforms = ("native",)
         else:
-            if gs.platform == "Windows" and opengl_platform_orig == "osmesa":
-                gs.raise_exception("PYOPENGL_PLATFORM='osmesa' is not supported on Windows OS.")
+            if opengl_platform_orig == "osmesa" and gs.platform != "Linux":
+                gs.raise_exception("PYOPENGL_PLATFORM='osmesa' is only supported on Linux OS for now.")
             all_opengl_platforms = (opengl_platform_orig,)
 
         for i, platform in enumerate(all_opengl_platforms):
@@ -105,9 +109,9 @@ class Viewer(RBC):
                         self._pyrender_viewer.start(auto_refresh=False)
                     self._pyrender_viewer.wait_until_initialized()
                 break
-            except OpenGL.error.Error:
+            except (OpenGL.error.Error, RuntimeError):
                 # Invalid OpenGL context. Trying another platform if any...
-                gs.logger.debug(f"Invalid OpenGL context.")
+                gs.logger.debug("Invalid OpenGL context.")
 
                 # Clear broken OpenGL context if it went this far
                 if self._pyrender_viewer is not None:
@@ -116,10 +120,10 @@ class Viewer(RBC):
 
                 if i == len(all_opengl_platforms) - 1:
                     raise
-
-            # Select PyOpenGL backend compatible with `pyrender.OffscreenRenderer`
-            if platform not in ("osmesa", "pyglet", "egl"):
-                os.environ["PYOPENGL_PLATFORM"] = "pyglet"
+            finally:
+                del os.environ["PYOPENGL_PLATFORM"]
+                if opengl_platform_orig is not None:
+                    os.environ["PYOPENGL_PLATFORM"] = opengl_platform_orig
 
         self.lock = ViewerLock(self._pyrender_viewer)
 
@@ -142,7 +146,7 @@ class Viewer(RBC):
         pose = gu.pos_lookat_up_to_T(self._camera_init_pos, self._camera_init_lookat, self._camera_up)
         self._camera_node = self.context.add_node(pyrender.PerspectiveCamera(yfov=yfov), pose=pose)
 
-    def update(self, auto_refresh=None):
+    def update(self, auto_refresh=None, force=False):
         if self._followed_entity is not None:
             self.update_following()
 
@@ -150,7 +154,7 @@ class Viewer(RBC):
 
         with self.lock:
             # Update context
-            self.context.update()
+            self.context.update(force)
 
             # Refresh viewer by default if and if this is possible
             if auto_refresh is None:
@@ -164,8 +168,11 @@ class Viewer(RBC):
         if self._max_FPS is not None:
             self.rate.sleep()
 
-    def render_offscreen(self, camera_node, render_target, depth=False, seg=False, normal=False):
-        return self._pyrender_viewer.render_offscreen(camera_node, render_target, depth, seg, normal)
+    def close_offscreen(self, render_target):
+        return self._pyrender_viewer.close_offscreen(render_target)
+
+    def render_offscreen(self, camera_node, render_target, rgb=True, depth=False, seg=False, normal=False):
+        return self._pyrender_viewer.render_offscreen(camera_node, render_target, rgb, depth, seg, normal)
 
     def set_camera_pose(self, pose=None, pos=None, lookat=None):
         """
@@ -219,10 +226,11 @@ class Viewer(RBC):
         """
         Update the viewer position to follow the specified entity.
         """
-        entity_pos = self._followed_entity.get_pos().cpu().numpy()
+        entity_pos = tensor_to_array(self._followed_entity.get_pos())
         if entity_pos.ndim > 1:  # check for multiple envs
             entity_pos = entity_pos[0]
-        camera_transform = np.asarray(self._pyrender_viewer._trackball.pose, copy=True)
+        # numpy < 2.0 doesn't support the copy keyword argument in np.asarray()
+        camera_transform = np.array(self._pyrender_viewer._trackball.pose, copy=True)
         camera_pos = np.array(self._pyrender_viewer._trackball.pose[:3, 3])
 
         if self._follow_smoothing is not None:

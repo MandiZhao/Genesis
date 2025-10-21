@@ -1,4 +1,5 @@
 import platform
+import io
 import os
 import subprocess
 import time
@@ -16,6 +17,7 @@ import numpy as np
 import mujoco
 import torch
 from huggingface_hub import snapshot_download
+from PIL import Image, UnidentifiedImageError
 from requests.exceptions import HTTPError
 
 import genesis as gs
@@ -23,10 +25,18 @@ import genesis.utils.geom as gu
 from genesis.utils import mjcf as mju
 from genesis.utils.mesh import get_assets_dir
 from genesis.utils.misc import tensor_to_array
+from genesis.options.morphs import URDF_FORMAT, MJCF_FORMAT, MESH_FORMATS, GLTF_FORMATS, USD_FORMATS
 
 
 REPOSITY_URL = "Genesis-Embodied-AI/Genesis"
 DEFAULT_BRANCH_NAME = "main"
+
+HUGGINGFACE_ASSETS_REVISION = "16e4eae0024312b84518f4b555dd630d6b34095a"
+HUGGINGFACE_SNAPSHOT_REVISION = "bfd02a635579cbd5aefa7027df54a433f8ad1915"
+
+MESH_EXTENSIONS = (".mtl", *MESH_FORMATS, *GLTF_FORMATS, *USD_FORMATS)
+IMAGE_EXTENSIONS = (".png", ".jpg")
+
 
 # Get repository "root" path (actually test dir is good enough)
 TEST_DIR = os.path.dirname(__file__)
@@ -164,40 +174,69 @@ def get_git_commit_info(ref="HEAD"):
     return revision, timestamp
 
 
-def get_hf_assets(pattern, num_retry: int = 4, retry_delay: float = 30.0, check: bool = True):
+def get_hf_dataset(
+    pattern,
+    repo_name: str = "assets",
+    local_dir: str | None = None,
+    num_retry: int = 4,
+    retry_delay: float = 30.0,
+    local_dir_use_symlinks: bool = True,
+):
     assert num_retry >= 1
 
-    for _ in range(num_retry):
-        num_trials = 0
+    if repo_name == "assets":
+        revision = HUGGINGFACE_ASSETS_REVISION
+    elif repo_name == "snapshots":
+        revision = HUGGINGFACE_SNAPSHOT_REVISION
+    else:
+        raise ValueError(f"Unsupported repository '{repo_name}'")
+
+    for i in range(num_retry):
         try:
             # Try downloading the assets
             asset_path = snapshot_download(
                 repo_type="dataset",
-                repo_id="Genesis-Intelligence/assets",
+                repo_id=f"Genesis-Intelligence/{repo_name}",
+                revision=revision,
                 allow_patterns=pattern,
                 max_workers=1,
+                local_dir=local_dir,
+                local_dir_use_symlinks=local_dir_use_symlinks,
             )
 
             # Make sure that download was successful
             has_files = False
-            for path in Path(asset_path).rglob(pattern):
+            for path in Path(asset_path).glob(pattern):
                 if not path.is_file():
                     continue
+
+                ext = path.suffix.lower()
+                if ext not in (URDF_FORMAT, MJCF_FORMAT, *IMAGE_EXTENSIONS, *MESH_EXTENSIONS):
+                    continue
+
                 has_files = True
 
                 if path.stat().st_size == 0:
                     raise HTTPError(f"File '{path}' is empty.")
 
-                if path.suffix.lower() in (".xml", ".urdf"):
+                if path.suffix.lower() in (URDF_FORMAT, MJCF_FORMAT):
                     try:
                         ET.parse(path)
                     except ET.ParseError as e:
-                        raise HTTPError(f"Impossible to parse XML file.") from e
+                        raise HTTPError("Impossible to parse XML file.") from e
+                elif path.suffix.lower() in IMAGE_EXTENSIONS:
+                    try:
+                        Image.open(path)
+                    except UnidentifiedImageError as e:
+                        raise HTTPError("Impossible to parse Image file.") from e
+                elif path.suffix.lower() in MESH_EXTENSIONS:
+                    # TODO: Validating mesh files is more tricky. Ignoring them for now.
+                    pass
+
             if not has_files:
                 raise HTTPError("No file downloaded.")
-        except HTTPError:
-            num_trials += 1
-            if num_trials == num_retry:
+        except (HTTPError, FileNotFoundError):
+            if i == num_retry - 1:
                 raise
             print(f"Failed to download assets from HuggingFace dataset. Trying again in {retry_delay}s...")
             time.sleep(retry_delay)
@@ -207,7 +246,8 @@ def get_hf_assets(pattern, num_retry: int = 4, retry_delay: float = 30.0, check:
     return asset_path
 
 
-def assert_allclose(actual, desired, *, atol=None, rtol=None, tol=None, err_msg=""):
+def assert_allclose(actual, desired, *, atol=None, rtol=None, tol=None, err_msg=None):
+    # Determine absolute and relative tolerance from input arguments
     assert (tol is not None) ^ (atol is not None or rtol is not None)
     if tol is not None:
         atol = tol
@@ -217,21 +257,28 @@ def assert_allclose(actual, desired, *, atol=None, rtol=None, tol=None, err_msg=
     if atol is None:
         atol = 0.0
 
+    # Convert input arguments as numpy arrays
     args = [actual, desired]
     for i, arg in enumerate(args):
-        if isinstance(arg, torch.Tensor):
-            arg = tensor_to_array(arg)
-        elif isinstance(arg, (tuple, list)):
-            arg = [tensor_to_array(val) for val in arg]
-        args[i] = np.asanyarray(arg)
+        if isinstance(arg, (tuple, list)):
+            arg = np.stack([tensor_to_array(val) for val in arg], axis=0)
+        args[i] = tensor_to_array(arg)
 
+    # Early return without checking anything is both arrays are empty (0D arrays have size 1).
     if all(e.size == 0 for e in args):
         return
+
+    # Try to make sure both arrays have the exact same shape.
+    # First, try to broadcast both matrices. Then it is does not work, squeeze them before trying again.
+    try:
+        args = np.broadcast_arrays(*args)
+    except ValueError:
+        args = np.broadcast_arrays(*map(np.squeeze, args))
 
     np.testing.assert_allclose(*args, atol=atol, rtol=rtol, err_msg=err_msg)
 
 
-def assert_array_equal(actual, desired, *, err_msg=""):
+def assert_array_equal(actual, desired, *, err_msg=None):
     assert_allclose(actual, desired, atol=0.0, rtol=0.0, err_msg=err_msg)
 
 
@@ -453,6 +500,7 @@ def build_mujoco_sim(
     model.opt.solver = mj_solver
     model.opt.integrator = mj_integrator
     model.opt.cone = mujoco.mjtCone.mjCONE_PYRAMIDAL
+    model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_ISLAND
     model.opt.disableflags &= ~np.uint32(mujoco.mjtDisableBit.mjDSBL_EULERDAMP)
     model.opt.disableflags &= ~np.uint32(mujoco.mjtDisableBit.mjDSBL_REFSAFE)
     model.opt.disableflags &= ~np.uint32(mujoco.mjtDisableBit.mjDSBL_GRAVITY)
@@ -890,7 +938,7 @@ def check_mujoco_data_consistency(
 
     # ------------------------------------------------------------------------
 
-    gs_com = gs_sim.rigid_solver.links_state.COM.to_numpy()[:, 0]
+    gs_com = gs_sim.rigid_solver.links_state.root_COM.to_numpy()[:, 0]
     gs_root_idx = np.unique(gs_sim.rigid_solver.links_info.root_idx.to_numpy()[gs_bodies_idx])
     mj_com = mj_sim.data.subtree_com
     mj_root_idx = np.unique(mj_sim.model.body_rootid[mj_bodies_idx])
@@ -976,3 +1024,10 @@ def simulate_and_check_mujoco_consistency(gs_sim, mj_sim, qpos=None, qvel=None, 
         gs_sim.scene.step()
         # if gs_sim.scene.visualizer:
         #     gs_sim.scene.visualizer.update()
+
+
+def rgb_array_to_png_bytes(rgb_arr: np.ndarray) -> bytes:
+    img = Image.fromarray(rgb_arr)
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    return buffer.getvalue()

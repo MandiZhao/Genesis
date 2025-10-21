@@ -1,21 +1,21 @@
 import os
 import pickle
+import sys
 import time
+import weakref
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 import torch
-import taichi as ti
+import gstaichi as ti
 from numpy.typing import ArrayLike
 
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.utils.misc import ALLOCATE_TENSOR_WARNING
-from genesis.engine.entities.base_entity import Entity
 from genesis.engine.force_fields import ForceField
 from genesis.engine.materials.base import Material
-from genesis.engine.entities import Emitter
 from genesis.engine.states.solvers import SimState
-from genesis.engine.simulator import Simulator
 from genesis.options import (
     AvatarOptions,
     BaseCouplerOptions,
@@ -35,11 +35,18 @@ from genesis.options import (
 from genesis.options.morphs import Morph
 from genesis.options.surfaces import Surface
 from genesis.options.renderers import Rasterizer, RendererOptions
+from genesis.options.sensors import SensorOptions
+from genesis.options.recorders import RecorderOptions
+from genesis.recorders import RecorderManager
 from genesis.repr_base import RBC
 from genesis.utils.tools import FPSTracker
 from genesis.utils.misc import redirect_libc_stderr, tensor_to_array
 from genesis.vis import Visualizer
 from genesis.utils.warnings import warn_once
+
+if TYPE_CHECKING:
+    from genesis.engine.entities.base_entity import Entity
+    from genesis.recorders import Recorder
 
 
 @gs.assert_initialized
@@ -102,6 +109,9 @@ class Scene(RBC):
         show_viewer: bool | None = None,
         show_FPS: bool | None = None,  # deprecated, use profiling_options.show_FPS instead
     ):
+        # Delay simulator import to allow specifying gstaichi array type at init
+        from genesis.engine.simulator import Simulator
+
         # Handling of default arguments
         sim_options = sim_options or SimOptions()
         coupler_options = coupler_options or LegacyCouplerOptions()
@@ -193,6 +203,9 @@ class Scene(RBC):
                 renderer_options=renderer,
             )
 
+        # recorders
+        self._recorder_manager = RecorderManager(self._sim.dt)
+
         # emitters
         self._emitters = gs.List()
 
@@ -204,6 +217,9 @@ class Scene(RBC):
         self._is_built = False
 
         gs.logger.info(f"Scene ~~~<{self._uid}>~~~ created.")
+
+    def __del__(self):
+        self.destroy()
 
     def _validate_options(
         self,
@@ -263,6 +279,39 @@ class Scene(RBC):
 
         if not isinstance(renderer_options, RendererOptions):
             gs.raise_exception("`renderer` should be an instance of `gs.renderers.Renderer`.")
+
+        # Validate rigid_options against sim_options
+        if rigid_options.box_box_detection is None:
+            rigid_options.box_box_detection = not sim_options.requires_grad
+        elif rigid_options.box_box_detection and sim_options.requires_grad:
+            gs.raise_exception(
+                "`rigid_options.box_box_detection` cannot be True when `sim_options.requires_grad` is True."
+            )
+        if not rigid_options.use_gjk_collision and sim_options.requires_grad:
+            gs.raise_exception(
+                "`rigid_options.use_gjk_collision` cannot be False when `sim_options.requires_grad` is True."
+            )
+        if rigid_options.enable_mujoco_compatibility and sim_options.requires_grad:
+            gs.raise_exception(
+                "`rigid_options.enable_mujoco_compatibility` cannot be True when `sim_options.requires_grad` is True."
+            )
+
+    def destroy(self):
+        if getattr(self, "_recorder_manager", None) is not None:
+            if self._recorder_manager.is_recording:
+                self._recorder_manager.stop()
+            self._recorder_manager = None
+
+        if getattr(self, "_visualizer", None) is not None:
+            self._visualizer.destroy()
+            self._visualizer = None
+
+        # Stop tracking this scene
+        try:
+            gs._scene_registry.remove(weakref.ref(self))
+        except ValueError:
+            # This scene may have been destroyed previously
+            pass
 
     @gs.assert_unbuilt
     def add_entity(
@@ -327,7 +376,7 @@ class Scene(RBC):
             if surface.vis_mode is None:
                 surface.vis_mode = "visual"
 
-            if surface.vis_mode not in ["visual", "collision", "sdf"]:
+            if surface.vis_mode not in ("visual", "collision", "sdf"):
                 gs.raise_exception(
                     f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['visual', 'collision', 'sdf']."
                 )
@@ -346,7 +395,7 @@ class Scene(RBC):
             if surface.vis_mode is None:
                 surface.vis_mode = "particle"
 
-            if surface.vis_mode not in ["particle", "recon"]:
+            if surface.vis_mode not in ("particle", "recon"):
                 gs.raise_exception(
                     f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['particle', 'recon']."
                 )
@@ -364,7 +413,7 @@ class Scene(RBC):
             if surface.vis_mode is None:
                 surface.vis_mode = "visual"
 
-            if surface.vis_mode not in ["visual", "particle", "recon"]:
+            if surface.vis_mode not in ("visual", "particle", "recon"):
                 gs.raise_exception(
                     f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['visual', 'particle', 'recon']."
                 )
@@ -403,8 +452,8 @@ class Scene(RBC):
     @gs.assert_unbuilt
     def link_entities(
         self,
-        parent_entity: Entity,
-        child_entity: Entity,
+        parent_entity: "Entity",
+        child_entity: "Entity",
         parent_link_name="",
         child_link_name="",
     ):
@@ -445,77 +494,120 @@ class Scene(RBC):
         parent_link._child_idxs.append(child_link.idx)
 
     @gs.assert_unbuilt
-    def add_light(
+    def add_mesh_light(
         self,
-        *,
         morph: Morph | None = None,
         color: ArrayLike | None = (1.0, 1.0, 1.0, 1.0),
         intensity: float = 20.0,
         revert_dir: bool | None = False,
         double_sided: bool | None = False,
-        beam_angle: float | None = 180.0,
-        pos: ArrayLike | None = None,
-        dir: ArrayLike | None = None,
-        directional: bool | None = None,
-        castshadow: bool | None = None,
-        cutoff: float | None = None,
+        cutoff: float | None = 180.0,
     ):
         """
-        Add a light to the scene.
-
-        Warning
-        -------
-        The signature of this method is different depending on the renderer being used, i.e.:
-        - RayTracer: 'add_light(self, morph, color, intensity, revert_dir, double_sided, beam_angle)'
-        - BatchRender: 'add_ligth(self, pos, dir, intensity, directional, castshadow, cutoff)'
-        - Rasterizer: **Unsupported**
+        Add a mesh light to the scene. Only supported by RayTracer.
 
         Parameters
         ----------
         morph : gs.morphs.Morph
-            The morph of the light. Must be an instance of `gs.morphs.Primitive` or `gs.morphs.Mesh`. Only supported by
-            RayTracer.
+            The morph of the light. Must be an instance of `gs.morphs.Primitive` or `gs.morphs.Mesh`.
         color : tuple of float, shape (3,)
-            The color of the light, specified as (r, g, b). Only supported by RayTracer.
+            The color of the light, specified as (r, g, b).
         intensity : float
             The intensity of the light.
         revert_dir : bool
             Whether to revert the direction of the light. If True, the light will be emitted towards the mesh's inside.
-            Only supported by RayTracer.
         double_sided : bool
-            Whether to emit light from both sides of surface. Only supported by RayTracer.
-        beam_angle : float
-            The beam angle of the light. Only supported by RayTracer.
-        pos : tuple of float, shape (3,)
-            The position of the light, specified as (x, y, z). Only supported by BatchRenderer.
-        dir : tuple of float, shape (3,)
-            The direction of the light, specified as (x, y, z). Only supported by BatchRenderer.
-        intensity : float
-            The intensity of the light. Only supported by BatchRenderer.
-        directional : bool
-            Whether the light is directional. Only supported by BatchRenderer.
-        castshadow : bool
-            Whether the light casts shadows. Only supported by BatchRenderer.
+            Whether to emit light from both sides of surface.
         cutoff : float
-            The cutoff angle of the light in degrees. Only supported by BatchRenderer.
+            The cutoff angle of the light in degrees. Range: [0.0, 180.0].
         """
-        if self._visualizer.batch_renderer is not None:
-            if any(map(lambda e: e is None, (pos, dir, intensity, directional, castshadow, cutoff))):
-                gs.raise_exception("Input arguments do not complain with expected signature when using 'BatchRenderer'")
-
-            self.visualizer.add_light(pos, dir, intensity, directional, castshadow, cutoff)
-        elif self.visualizer.raytracer is not None:
-            if any(map(lambda e: e is None, (morph, color, intensity, revert_dir, double_sided, beam_angle))):
-                gs.raise_exception("Input arguments do not complain with expected signature when using 'RayTracer'")
-            if not isinstance(morph, (gs.morphs.Primitive, gs.morphs.Mesh)):
-                gs.raise_exception("Light morph only supports `gs.morphs.Primitive` or `gs.morphs.Mesh`.")
-
-            mesh = gs.Mesh.from_morph_surface(morph, gs.surfaces.Plastic(smooth=False))
-            self.visualizer.raytracer.add_mesh_light(
-                mesh, color, intensity, morph.pos, morph.quat, revert_dir, double_sided, beam_angle
+        if not isinstance(self.renderer_options, gs.renderers.RayTracer):
+            gs.raise_exception(
+                "This method is only supported by RayTracer. Please use 'add_light' when using BatchRenderer."
             )
-        else:
-            gs.raise_exception("Adding lights is only supported by 'RayTracer' and 'BatchRenderer'.")
+
+        if not isinstance(morph, (gs.morphs.Primitive, gs.morphs.Mesh)):
+            gs.raise_exception("Light morph only supports `gs.morphs.Primitive` or `gs.morphs.Mesh`.")
+        mesh = gs.Mesh.from_morph_surface(morph, gs.surfaces.Plastic(smooth=False))
+        self._visualizer.add_mesh_light(mesh, color, intensity, morph.pos, morph.quat, revert_dir, double_sided, cutoff)
+
+    @gs.assert_unbuilt
+    def add_light(
+        self,
+        pos: ArrayLike,
+        dir: ArrayLike,
+        color: ArrayLike = (1.0, 1.0, 1.0),
+        intensity: float = 1.0,
+        directional: bool = False,
+        castshadow: bool = True,
+        cutoff: float = 45.0,
+        attenuation: float = 0.0,
+    ):
+        """
+        Add a light to the scene for batch renderer.
+
+        Parameters
+        ----------
+        pos : tuple of float, shape (3,)
+            The position of the light, specified as (x, y, z).
+        dir : tuple of float, shape (3,)
+            The direction of the light, specified as (x, y, z).
+        color : tuple of float, shape (3,)
+            The color of the light, specified as (r, g, b).
+        intensity : float
+            The intensity of the light.
+        directional : bool
+            Whether the light is directional.
+        castshadow : bool
+            Whether the light casts shadows.
+        cutoff : float
+            The cutoff angle of the light in degrees. Range: (0.0, 90.0).
+        attenuation : float
+            The attenuation factor of the light.
+            Light intensity will attenuate by distance with (1 / (1 + attenuation * distance ^ 2))
+        """
+        if not isinstance(self.renderer_options, gs.renderers.BatchRenderer):
+            gs.raise_exception(
+                "This method is only supported by BatchRenderer. Please use 'add_mesh_light' when using RayTracer."
+            )
+
+        self.visualizer.add_light(pos, dir, color, intensity, directional, castshadow, cutoff, attenuation)
+
+    @gs.assert_unbuilt
+    def add_sensor(self, sensor_options: "SensorOptions"):
+        """
+        Add a sensor to the scene.
+
+        Sensors extract information from the scene without modifying the physics simulation.
+
+        Parameters
+        ----------
+        sensor_options : SensorOptions
+            The options for the sensor.
+        """
+        return self._sim._sensor_manager.create_sensor(sensor_options)
+
+    @gs.assert_unbuilt
+    def start_recording(self, data_func: Callable, rec_options: "RecorderOptions") -> "Recorder":
+        """
+        Automatically read and process data. See RecorderOptions for more details.
+
+        Data from `data_func` is automatically read and processed using the recorder at the
+        frequency `rec_options.hz` (or every step if not specified) as the scene is stepped.
+
+        Parameters
+        ----------
+        data_func: Callable
+            A function with no arguments that returns the data to be recorded.
+        rec_options : RecorderOptions
+            The options for the recording.
+
+        Returns
+        -------
+        recorder : Recorder
+            The created recorder object.
+        """
+        return self._recorder_manager.add_recorder(data_func, rec_options)
 
     @gs.assert_unbuilt
     def add_camera(
@@ -530,8 +622,11 @@ class Scene(RBC):
         focus_dist=None,
         GUI=False,
         spp=256,
-        denoise=True,
+        denoise=None,
+        near=0.1,
+        far=20.0,
         env_idx=None,
+        debug=False,
     ):
         """
         Add a camera to the scene.
@@ -568,8 +663,26 @@ class Scene(RBC):
             Samples per pixel. Only available when using RayTracer renderer. Defaults to 256.
         denoise : bool
             Whether to denoise the camera's rendered image. Only available when using the RayTracer renderer. Defaults
-            to True. If OptiX denoiser is not available in your platform, consider enabling the OIDN denoiser option
-            when building the RayTracer.
+            to True on Linux, otherwise False. If OptiX denoiser is not available in your platform, consider enabling
+            the OIDN denoiser option when building the RayTracer.
+        near : float
+            Distance from camera center to near plane in meters.
+            Only available when using rasterizer in Rasterizer and BatchRender renderer. Defaults to 0.1.
+        far : float
+            Distance from camera center to far plane in meters.
+            Only available when using rasterizer in Rasterizer and BatchRender renderer. Defaults to 20.0.
+        env_idx : int, optional
+            The specific environment index to bind to the camera. This option must be specified if and only if a
+            non-batched renderer is being used. If provided, only this environment will be taken into account when
+            following a rigid entity via 'follow_entity' and when being attached to some rigid link via 'attach'. Note
+            that this option is unrelated to which environment is being rendering on the scene. Default to None for
+            batched renderers (ie BatchRender), 'rendered_envs_idx[0]' otherwise (ie Raytracer or Rasterizer).
+        debug : bool
+            Whether to use the debug camera. It enables to create cameras that can used to monitor / debug the
+            simulation without being part of the "sensors". Their output is rendered by the usual simple Rasterizer
+            systematically, no matter if BatchRender and RayTracer is enabled. This way, it is possible to record the
+            simulation with arbitrary resolution and camera pose, without interfering with what robots can perceive
+            from their environment. Defaults to False.
 
         Returns
         -------
@@ -578,8 +691,10 @@ class Scene(RBC):
         """
         if not self._use_visualizer:
             return 
+        if denoise is None:
+            denoise = sys.platform != "darwin"
         return self._visualizer.add_camera(
-            res, pos, lookat, up, model, fov, aperture, focus_dist, GUI, spp, denoise, env_idx
+            res, pos, lookat, up, model, fov, aperture, focus_dist, GUI, spp, denoise, near, far, env_idx, debug
         )
 
     @gs.assert_unbuilt
@@ -595,18 +710,21 @@ class Scene(RBC):
         Parameters
         ----------
         material : gs.materials.Material
-            The material of the fluid to be emitted. Must be an instance of `gs.materials.MPM.Base` or `gs.materials.SPH.Base`.
+            The material of the fluid to be emitted. Must be an instance of `gs.materials.MPM.Base`,
+            `gs.materials.SPH.Base`, `gs.materials.PBD.Particle` or `gs.materials.PBD.Liquid`.
         max_particles : int
-            The maximum number of particles that can be emitted by the emitter. Particles will be recycled once this limit is reached.
+            The maximum number of particles that can be emitted by the emitter. Particles will be recycled once this
+            limit is reached.
         surface : gs.surfaces.Surface | None, optional
-            The surface of the emitter. If None, use ``gs.surfaces.Default(color=(0.6, 0.8, 1.0, 1.0))``.
+            The surface of the emitter. If None, use `gs.surfaces.Default(color=(0.6, 0.8, 1.0, 1.0))`.
 
         Returns
         -------
         emitter : genesis.Emitter
             The created emitter object.
-
         """
+        from genesis.engine.entities import Emitter
+
         if self.requires_grad:
             gs.raise_exception("Emitter is not supported in differentiable mode.")
 
@@ -614,11 +732,17 @@ class Scene(RBC):
             material, (gs.materials.MPM.Base, gs.materials.SPH.Base, gs.materials.PBD.Particle, gs.materials.PBD.Liquid)
         ):
             gs.raise_exception(
-                "Non-supported material for emitter. Supported materials are: `gs.materials.MPM.Base`, `gs.materials.SPH.Base`, `gs.materials.PBD.Particle`, `gs.materials.PBD.Liquid`."
+                "Non-supported material for emitter. Supported materials are: `gs.materials.MPM.Base`, "
+                "`gs.materials.SPH.Base`, `gs.materials.PBD.Particle`, `gs.materials.PBD.Liquid`."
             )
 
         if surface is None:
             surface = gs.surfaces.Default(color=(0.6, 0.8, 1.0, 1.0))
+
+        if surface.vis_mode is None:
+            surface.vis_mode = "particle"
+        if surface.vis_mode == "visual":
+            gs.raise_exception("surface.vis_mode='visual' is not supported for fluid emitters.")
 
         emitter = Emitter(max_particles)
         entity = self.add_entity(
@@ -656,7 +780,7 @@ class Scene(RBC):
         env_spacing=(0.0, 0.0),
         n_envs_per_row: int | None = None,
         center_envs_at_origin=True,
-        compile_kernels=True,
+        compile_kernels=None,
     ):
         """
         Builds the scene once all entities have been added. This operation is required before running the simulation.
@@ -664,16 +788,23 @@ class Scene(RBC):
         Parameters
         ----------
         n_envs : int
-            Number of parallel environments to create. If `n_envs` is 0, the scene will not have a batching dimension. If `n_envs` is greater than 0, the first dimension of all the input and returned states will be the batch dimension.
+            Number of parallel environments to create.
+            If `n_envs` is 0, the scene will not have a batching dimension. When greater than 0, the first dimension of
+            all the input and returned states will be the batch dimension.
         env_spacing : tuple of float, shape (2,)
-            The spacing between adjacent environments in the scene. This is for visualization purposes only and does not change simulation-related poses.
+            The spacing between adjacent environments in the scene.
+            This is for visualization purposes only and does not change simulation-related poses.
         n_envs_per_row : int
             The number of environments per row for visualization. If None, it will be set to `sqrt(n_envs)`.
         center_envs_at_origin : bool
             Whether to put the center of all the environments at the origin (for visualization only).
-        compile_kernels : bool
-            Whether to compile the simulation kernels inside `build()`. If False, the kernels will not be compiled (or loaded if found in the cache) until the first call of `scene.step()`. This is useful for cases you don't want to run the actual simulation, but rather just want to visualize the created scene.
+        compile_kernels : bool, optional
+            This parameter is deprecated and will be removed in future release.
         """
+        if compile_kernels is not None:
+            warn_once("`compile_kernels` is deprecated and will be removed in future release.")
+            compile_kernels = True
+
         with gs.logger.timer(f"Building scene ~~~<{self._uid}>~~~..."):
             self._parallelize(n_envs, env_spacing, n_envs_per_row, center_envs_at_origin)
 
@@ -686,10 +817,9 @@ class Scene(RBC):
 
             self._is_built = True
 
-        if compile_kernels:
-            with gs.logger.timer("Compiling simulation kernels..."):
-                self._sim.step()
-                self._reset()
+        with gs.logger.timer("Compiling simulation kernels..."):
+            self._sim.step()
+            self._reset()
 
         # visualizer
         if self._use_visualizer:
@@ -699,7 +829,18 @@ class Scene(RBC):
         if self.profiling_options.show_FPS:
             self.FPS_tracker = FPSTracker(self.n_envs, alpha=self.profiling_options.FPS_tracker_alpha)
 
-        gs.global_scene_list.add(self)
+        # recorders
+        self._recorder_manager.build()
+
+        # Update global scene registry
+        def _destroy_callback(scene_ref: weakref.ReferenceType["Scene"]):
+            scene = scene_ref()
+            for i, scene_ref_i in enumerate(gs._scene_registry):
+                if scene is scene_ref_i():
+                    del gs._scene_registry[i]
+                    break
+
+        gs._scene_registry.append(weakref.ref(self, _destroy_callback))
 
     def _parallelize(
         self,
@@ -763,6 +904,7 @@ class Scene(RBC):
         """
         gs.logger.debug(f"Resetting Scene ~~~<{self._uid}>~~~.")
         self._reset(state, envs_idx=envs_idx)
+        self._recorder_manager.reset(envs_idx)
 
     def _reset(self, state: SimState | None = None, *, envs_idx=None):
         if self._is_built:
@@ -778,7 +920,14 @@ class Scene(RBC):
         self._t = 0
         self._forward_ready = True
         self._reset_grad()
+<<<<<<< HEAD
         if self._use_visualizer:
+=======
+
+        # Clear the entire cache of the visualizer.
+        # TODO: Could be optimized to only clear cache associated the the environments being reset.
+        if self._visualizer.is_built:
+>>>>>>> 43b5b7bbf37ab103b38d49d3d5882a8137fe9436
             self._visualizer.reset()
 
         # TODO: sets _next_particle = 0; not sure this is env isolation safe
@@ -820,6 +969,11 @@ class Scene(RBC):
 
         if self.profiling_options.show_FPS:
             self.FPS_tracker.step()
+
+        self._recorder_manager.step(self._sim.cur_step_global)
+
+    def stop_recording(self):
+        self._recorder_manager.stop()
 
     def _step_grad(self):
         self._sim.collect_output_grads()
@@ -1088,7 +1242,16 @@ class Scene(RBC):
             )
 
     @gs.assert_built
-    def render_all_cameras(self, rgb=True, depth=False, normal=False, segmentation=False, force_render=False):
+    def render_all_cameras(
+        self,
+        rgb=True,
+        depth=False,
+        segmentation=False,
+        colorize_seg=False,
+        normal=False,
+        antialiasing=False,
+        force_render=False,
+    ):
         """
         Render the scene for all cameras using the batch renderer.
 
@@ -1098,30 +1261,37 @@ class Scene(RBC):
             Whether to render the rgb image.
         depth : bool, optional
             Whether to render the depth image.
-        normal : bool, optional
-            Whether to render the normal image.
         segmentation : bool, optional
             Whether to render the segmentation image.
+        normal : bool, optional
+            Whether to render the normal image.
+        antialiasing : bool, optional
+            Whether to apply anti-aliasing.
         force_render : bool, optional
             Whether to force render the scene.
 
         Returns:
             A tuple of tensors of shape (n_envs, H, W, 3) if rgb is not None,
-            otherwise a list of tensors of shape (n_envs, H, W, 1) if depth is not None.
+            otherwise a list of tensors of shape (n_envs, H, W) if depth is not None.
             If n_envs == 0, the first dimension of the tensor is squeezed.
         """
         if self._visualizer.batch_renderer is None:
             gs.raise_exception("Method only supported by 'BatchRenderer'")
 
-        return self._visualizer.batch_renderer.render(rgb, depth, normal, segmentation, force_render)
+        rgb_out, depth_out, seg_out, normal_out = self._visualizer.batch_renderer.render(
+            rgb, depth, segmentation, normal, antialiasing, force_render
+        )
+        if segmentation and colorize_seg:
+            seg_out = tuple(self._visualizer.batch_renderer.colorize_seg_idxc_arr(seg) for seg in seg_out)
+        return rgb_out, depth_out, seg_out, normal_out
 
     @gs.assert_built
-    def clear_debug_object(self, object):
+    def clear_debug_object(self, obj):
         """
         Clears all the debug objects in the scene.
         """
         with self._visualizer.viewer_lock:
-            self._visualizer.context.clear_debug_object(object)
+            self._visualizer.context.clear_debug_object(obj)
 
     @gs.assert_built
     def clear_debug_objects(self):
@@ -1159,9 +1329,9 @@ class Scene(RBC):
         """
         arrays: dict[str, np.ndarray] = {}
 
-        for name, field in self.__dict__.items():
-            if isinstance(field, ti.Field):
-                arrays[".".join((self.__class__.__name__, name))] = field.to_numpy()
+        for name, value in self.__dict__.items():
+            if isinstance(value, (ti.Field, ti.Ndarray)):
+                arrays[".".join((self.__class__.__name__, name))] = value.to_numpy()
 
         for solver in self.active_solvers:
             arrays.update(solver.dump_ckpt_to_numpy())
@@ -1199,11 +1369,11 @@ class Scene(RBC):
 
         arrays = state["arrays"]
 
-        for name, field in self.__dict__.items():
-            if isinstance(field, ti.Field):
+        for name, value in self.__dict__.items():
+            if isinstance(value, (ti.Field, ti.Ndarray)):
                 key = ".".join((self.__class__.__name__, name))
                 if key in arrays:
-                    field.from_numpy(arrays[key])
+                    value.from_numpy(arrays[key])
 
         for solver in self.active_solvers:
             solver.load_ckpt_from_numpy(arrays)
@@ -1275,7 +1445,7 @@ class Scene(RBC):
         return self._sim.requires_grad
 
     @property
-    def is_built(self):
+    def is_built(self) -> bool:
         """Whether the scene has been built."""
         return self._is_built
 
@@ -1321,7 +1491,7 @@ class Scene(RBC):
         return self._sim.active_solvers
 
     @property
-    def entities(self) -> list[Entity]:
+    def entities(self) -> list["Entity"]:
         """All the entities in the scene."""
         return self._sim.entities
 
@@ -1364,3 +1534,18 @@ class Scene(RBC):
     def pbd_solver(self):
         """The scene's `pbd_solver`, managing all the `PBDEntity` in the scene."""
         return self._sim.pbd_solver
+
+    @property
+    def segmentation_idx_dict(self):
+        """
+        Returns a dictionary mapping segmentation indices to scene entities.
+
+        In the segmentation map:
+        - Index 0 corresponds to the background (-1).
+        - Indices > 0 correspond to scene elements, which may be represented as:
+            - `entity_id`
+            - `(entity_id, link_id)`
+            - `(entity_id, link_id, geom_id)`
+          depending on the material type and the configured segmentation level.
+        """
+        return self._visualizer.segmentation_idx_dict

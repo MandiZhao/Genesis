@@ -1,14 +1,10 @@
+import gstaichi as ti
 import numpy as np
-import taichi as ti
+import trimesh
 
 import genesis as gs
 import genesis.utils.geom as gu
-from genesis.utils.mesh import (
-    cleanup_mesh,
-    compute_sdf_data,
-    load_mesh,
-    normalize_mesh,
-)
+from genesis.utils.mesh import compute_sdf_data, load_mesh
 
 
 @ti.data_oriented
@@ -41,10 +37,18 @@ class Mesh:
         self.n_faces = len(self.faces_np)
 
     def process_mesh(self):
-        # clean up mesh
+        # Normalize mesh
         gs.logger.debug(f"Processing mesh: {self.raw_file}.")
-        raw_mesh = load_mesh(self.raw_file)
-        self.mesh = cleanup_mesh(normalize_mesh(raw_mesh))
+        mesh_orig = load_mesh(self.raw_file)
+        scale = np.linalg.norm(mesh_orig.extents, ord=float("inf"))
+        center = np.mean(mesh_orig.bounds, axis=0)
+        normalized_vertices = (mesh_orig.vertices - center) / scale
+        self.mesh = trimesh.Trimesh(
+            vertices=normalized_vertices,
+            faces=mesh_orig.faces,
+            vertex_normals=mesh_orig.vertex_normals,
+            face_normals=mesh_orig.face_normals,
+        )
 
         # generate sdf
         if self.collision:
@@ -58,7 +62,7 @@ class Mesh:
         # init ti fields
         self.init_vertices = ti.Vector.field(3, dtype=gs.ti_float, shape=(self.n_vertices))
         self.init_vertex_normals = ti.Vector.field(3, dtype=gs.ti_float, shape=(self.n_vertices))
-        self.faces = ti.field(dtype=gs.ti_int, shape=(self.n_faces))
+        self.faces = ti.field(dtype=gs.ti_int, shape=(self.n_faces,))
 
         self.init_vertices.from_numpy(self.raw_vertices)
         self.init_vertex_normals.from_numpy(self.raw_vertex_normals)
@@ -86,7 +90,7 @@ class Mesh:
     def sdf_(self, pos_voxels):
         # sdf value from voxels coordinate
         base = ti.floor(pos_voxels, gs.ti_int)
-        signed_dist = ti.cast(0.0, gs.ti_float)
+        signed_dist = gs.ti_float(0.0)
         if (base >= self.sdf_res - 1).any() or (base < 0).any():
             signed_dist = 1.0
         else:
@@ -117,7 +121,7 @@ class Mesh:
     @ti.func
     def normal_(self, pos_voxels):
         # since we are in voxels frame, delta can be a relatively big value
-        delta = ti.cast(1e-2, gs.ti_float)
+        delta = gs.ti_float(1e-2)
         normal_vec = ti.Vector([0, 0, 0], dt=gs.ti_float)
 
         for i in ti.static(range(3)):
@@ -146,7 +150,7 @@ class Mesh:
             signed_dist = self.sdf(f, pos_world, i_b)
             # bigger coup_softness implies that the coupling influence extends further away from the object.
             influence = ti.min(ti.exp(-signed_dist / max(gs.EPS, self.material.coup_softness)), 1)
-            if signed_dist <= 0 or influence > 0.1:
+            if signed_dist <= 0.0 or influence > 0.1:
                 vel_collider = self.vel_collider(f, pos_world, i_b)
 
                 # v w.r.t collider
@@ -154,7 +158,7 @@ class Mesh:
                 normal_vec = self.normal(f, pos_world, i_b)
                 normal_component = rel_v.dot(normal_vec)
 
-                if normal_component < 0:
+                if normal_component < 0.0:
                     # remove inward velocity
                     rel_v_t = rel_v - normal_component * normal_vec
                     rel_v_t_norm = rel_v_t.norm(gs.EPS)
@@ -165,9 +169,10 @@ class Mesh:
                     )
 
                     # tangential component after friction
-                    flag = ti.cast(normal_component < 0, gs.ti_float)
-                    rel_v_t = rel_v_t_friction * flag + rel_v_t * (1 - flag)
-                    vel_mat = vel_collider + rel_v_t * influence + rel_v * (1 - influence)
+                    # FIXME: This formula could be simplified since flag = 1.0 systematically.
+                    flag = ti.cast(normal_component < 0.0, gs.ti_float)
+                    rel_v_t = rel_v_t_friction * flag + rel_v_t * (1.0 - flag)
+                    vel_mat = vel_collider + rel_v_t * influence + rel_v * (1.0 - influence)
 
         return vel_mat
 

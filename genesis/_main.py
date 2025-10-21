@@ -9,8 +9,8 @@ from tkinter import ttk
 
 import numpy as np
 import torch
-from taichi._lib import core as _ti_core
-from taichi.lang import impl
+from gstaichi._lib import core as _ti_core
+from gstaichi.lang import impl
 
 import genesis as gs
 
@@ -97,12 +97,6 @@ def get_motors_info(robot):
     return motors_dof_idx, motors_dof_name
 
 
-def clean():
-    print("Cleaned up all genesis and taichi cache files...")
-    gs.utils.misc.clean_cache_files()
-    _ti_core.clean_offline_cache_files(os.path.abspath(impl.default_cfg().offline_cache_file_path))
-
-
 def _start_gui(motors_name, motors_position_limit, motors_position, stop_event):
     def on_close():
         nonlocal after_id
@@ -143,6 +137,7 @@ def view(filename, collision, rotate, scale=1.0, show_link_frame=False):
         ),
         vis_options=gs.options.VisOptions(
             show_link_frame=show_link_frame,
+            show_world_frame=True,
         ),
         show_viewer=True,
     )
@@ -219,7 +214,7 @@ def main():
     parser = argparse.ArgumentParser(description="Genesis CLI")
     subparsers = parser.add_subparsers(dest="command")
 
-    parser_clean = subparsers.add_parser("clean", help="Clean all the files cached by genesis and taichi")
+    parser_clean = subparsers.add_parser("clean", help="Clean all the files cached by genesis and gstaichi")
 
     parser_view = subparsers.add_parser("view", help="Visualize a given asset (mesh/URDF/MJCF)")
     parser_view.add_argument("filename", type=str, help="File to visualize")
@@ -236,9 +231,7 @@ def main():
 
     args = parser.parse_args()
 
-    if args.command == "clean":
-        clean()
-    elif args.command == "view":
+    if args.command == "view":
         view(args.filename, args.collision, args.rotate, args.scale, args.link_frame)
     elif args.command == "animate":
         animate(args.filename_pattern, args.fps)

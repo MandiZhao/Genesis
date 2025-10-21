@@ -1,16 +1,30 @@
+import base64
+import ctypes
 import gc
 import os
 import re
 import sys
 from enum import Enum
+from io import BytesIO
+from pathlib import Path
 
+import psutil
+import pyglet
 import pytest
 from _pytest.mark import Expression, MarkMatcher
+from PIL import Image
+from syrupy.extensions.image import PNGImageSnapshotExtension
+from syrupy.location import PyTestLocation
 
-# Mock tkinter module for backward compatibility because old Genesis versions require it
+has_display = True
 try:
-    import tkinter
-except ImportError:
+    from tkinter import Tk
+
+    root = Tk()
+    root.withdraw()
+    root.destroy()
+except Exception:  # ImportError, TclError
+    # Mock tkinter module for backward compatibility because it is a hard dependency for old Genesis versions
     tkinter = type(sys)("tkinter")
     tkinter.Tk = type(sys)("Tk")
     tkinter.filedialog = type(sys)("filedialog")
@@ -18,14 +32,34 @@ except ImportError:
     sys.modules["tkinter.Tk"] = tkinter.Tk
     sys.modules["tkinter.filedialog"] = tkinter.filedialog
 
+    # Assuming headless server if tkinder is not installed
+    has_display = False
+
+has_egl = True
+try:
+    pyglet.lib.load_library("EGL")
+except ImportError:
+    has_egl = False
+
+if not has_display and has_egl:
+    # It is necessary to configure pyglet in headless mode if necessary before importing Genesis.
+    # Note that environment variables are used instead of global options to ease option propagation to subprocesses.
+    pyglet.options["headless"] = True
+    os.environ["PYGLET_HEADLESS"] = "1"
+
+IS_INTERACTIVE_VIEWER_AVAILABLE = has_display or has_egl
 
 TOL_SINGLE = 5e-5
 TOL_DOUBLE = 1e-9
+IMG_STD_ERR_THR = 1.0
+IMG_NUM_ERR_THR = 0.001
 
 
 def pytest_make_parametrize_id(config, val, argname):
     if isinstance(val, Enum):
         return val.name
+    if isinstance(val, type):
+        return ".".join((val.__module__, val.__name__))
     return f"{val}"
 
 
@@ -58,6 +92,16 @@ def pytest_cmdline_main(config: pytest.Config) -> None:
     if show_viewer:
         config.option.numprocesses = 0
 
+    # Force disabling reruns if debugger is enabled
+    is_pdb_enabled = config.getoption("--pdb")
+    if is_pdb_enabled:
+        config.option.reruns = 0
+
+    # Force headless rendering if available and the interactive viewer is disabled.
+    # FIXME: It breaks rendering on some platform...
+    # if not show_viewer and has_egl:
+    #     pyglet.options["headless"] = True
+
     # Disable low-level parallelization if distributed framework is enabled.
     # FIXME: It should be set to `max(int(physical_core_count / num_workers), 1)`, but 'num_workers' may be unknown.
     if not is_benchmarks and config.option.numprocesses != 0:
@@ -87,14 +131,58 @@ def _get_gpu_indices():
     return (0,)
 
 
+def _get_egl_index(gpu_index):
+    from OpenGL import EGL
+    from OpenGL.EGL.NV.device_cuda import EGL_CUDA_DEVICE_NV
+
+    # Get the list of Nvidia GPU that are visible
+    nvidia_gpu_indices = _get_gpu_indices()
+
+    # Define some ctypes for convenience
+    EGLDeviceEXT = ctypes.c_void_p
+    EGLAttrib = ctypes.c_ssize_t
+    EGLint = ctypes.c_int
+    EGLuint = ctypes.c_uint
+
+    # Load EGL extension functions dynamically
+    EGLuint = ctypes.c_uint
+    eglQueryDevicesEXT_addr = EGL.eglGetProcAddress(b"eglQueryDevicesEXT")
+    if not eglQueryDevicesEXT_addr:
+        raise RuntimeError("eglQueryDevicesEXT not available")
+    eglQueryDevicesEXT = ctypes.CFUNCTYPE(EGLuint, EGLint, ctypes.POINTER(EGLDeviceEXT), ctypes.POINTER(EGLint))(
+        eglQueryDevicesEXT_addr
+    )
+    eglQueryDeviceAttribEXT_addr = EGL.eglGetProcAddress(b"eglQueryDeviceAttribEXT")
+    if not eglQueryDeviceAttribEXT_addr:
+        raise RuntimeError("eglQueryDeviceAttribEXT not available")
+    eglQueryDeviceAttribEXT = ctypes.CFUNCTYPE(EGLuint, EGLDeviceEXT, EGLint, ctypes.POINTER(EGLAttrib))(
+        eglQueryDeviceAttribEXT_addr
+    )
+
+    # Query EGL devices
+    num_devices = EGLint()
+    eglQueryDevicesEXT(0, None, ctypes.byref(num_devices))
+    devices = (EGLDeviceEXT * num_devices.value)()
+    eglQueryDevicesEXT(num_devices, devices, ctypes.byref(num_devices))
+    egl_map = {}
+    for i in range(num_devices.value):
+        dev = devices[i]
+        cuda_id = EGLAttrib()
+        if eglQueryDeviceAttribEXT(dev, EGL_CUDA_DEVICE_NV, ctypes.byref(cuda_id)):
+            egl_map[nvidia_gpu_indices[cuda_id.value]] = i
+
+    return egl_map[gpu_index]
+
+
 def pytest_xdist_auto_num_workers(config):
-    import psutil
     import genesis as gs
 
     # Get available memory (RAM & VRAM) and number of cores
     physical_core_count = psutil.cpu_count(logical=config.option.logical)
     _, _, ram_memory, _ = gs.utils.get_device(gs.cpu)
     _, _, vram_memory, backend = gs.utils.get_device(gs.gpu)
+    num_gpus = len(_get_gpu_indices())
+    vram_memory *= num_gpus
     if backend == gs.cpu:
         # Ignore VRAM if no GPU is available
         vram_memory = float("inf")
@@ -102,15 +190,14 @@ def pytest_xdist_auto_num_workers(config):
     # Compute the default number of workers based on available RAM, VRAM, and number of physical cores.
     # Note that if `forked` is not enabled, up to 7.5Gb per worker is necessary on Linux because Taichi
     # does not completely release memory between each test.
-    if sys.platform in ("darwin", "win32"):
-        ram_memory_per_worker = 3.0
-        vram_memory_per_worker = 1.0  # Does not really makes sense on Apple Silicon
+    if sys.platform in "darwin":
+        ram_memory_per_worker = vram_memory_per_worker = 3.0
     elif config.option.forked:
         ram_memory_per_worker = 5.5
-        vram_memory_per_worker = 1.2
+        vram_memory_per_worker = 1.8
     else:
         ram_memory_per_worker = 7.5
-        vram_memory_per_worker = 1.6
+        vram_memory_per_worker = 2.5
     num_workers = min(
         physical_core_count,
         max(int(ram_memory / ram_memory_per_worker), 1),
@@ -124,7 +211,7 @@ def pytest_xdist_auto_num_workers(config):
         num_cpu_per_gpu = 4
         num_workers = min(
             num_workers,
-            len(_get_gpu_indices()),
+            num_gpus,
             max(int(physical_core_count / num_cpu_per_gpu), 1),
         )
 
@@ -132,14 +219,18 @@ def pytest_xdist_auto_num_workers(config):
 
 
 def pytest_runtest_setup(item):
-    # Enforce GPU affinity that distributed framework is enabled
+    # Enforce GPU affinity if distributed framework is enabled
     worker_id = os.environ.get("PYTEST_XDIST_WORKER")
     if worker_id and worker_id.startswith("gw"):
         worker_num = int(worker_id[2:])
         gpu_indices = _get_gpu_indices()
-        gpu_num = worker_num % len(gpu_indices)
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_indices[gpu_num])
-        os.environ["TI_VISIBLE_DEVICE"] = str(gpu_indices[gpu_num])
+        gpu_index = gpu_indices[worker_num % len(gpu_indices)]
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+        os.environ["TI_VISIBLE_DEVICE"] = str(gpu_index)
+        try:
+            os.environ["EGL_DEVICE_ID"] = str(_get_egl_index(gpu_index))
+        except Exception:
+            pass
 
 
 def pytest_addoption(parser):
@@ -148,11 +239,12 @@ def pytest_addoption(parser):
         "--logical", action="store_true", default=False, help="Consider logical cores in default number of workers."
     )
     parser.addoption("--vis", action="store_true", default=False, help="Enable interactive viewer.")
+    parser.addoption("--dev", action="store_true", default=False, help="Enable genesis debug mode.")
 
 
 @pytest.fixture(scope="session")
 def show_viewer(pytestconfig):
-    return pytestconfig.getoption("--vis")
+    return pytestconfig.getoption("--vis") and IS_INTERACTIVE_VIEWER_AVAILABLE
 
 
 @pytest.fixture(scope="session")
@@ -176,6 +268,21 @@ def tol():
     import genesis as gs
 
     return TOL_DOUBLE if gs.np_float == np.float64 else TOL_SINGLE
+
+
+@pytest.fixture
+def precision(request, backend):
+    import genesis as gs
+
+    precision = None
+    for mark in request.node.iter_markers("precision"):
+        if mark.args:
+            if precision is not None:
+                pytest.fail("'precision' can only be specified once.")
+            (precision,) = mark.args
+    if precision is None:
+        precision = "64" if backend == gs.cpu else "32"
+    return precision
 
 
 @pytest.fixture
@@ -269,37 +376,84 @@ def taichi_offline_cache(request):
     return taichi_offline_cache
 
 
+@pytest.fixture
+def performance_mode(request):
+    performance_mode = None
+    for mark in request.node.iter_markers("performance_mode"):
+        if mark.args:
+            if performance_mode is not None:
+                pytest.fail("'performance_mode' can only be specified once.")
+            (performance_mode,) = mark.args
+    if performance_mode is None:
+        performance_mode = False
+    return performance_mode
+
+
 @pytest.fixture(scope="function", autouse=True)
-def initialize_genesis(request, backend, taichi_offline_cache):
-    import pyglet
+def initialize_genesis(request, monkeypatch, tmp_path, backend, precision, performance_mode, taichi_offline_cache):
     import genesis as gs
-    from genesis.utils.misc import ALLOCATE_TENSOR_WARNING
+
+    # Early return if backend is None
+    if backend is None:
+        yield
+        return
 
     logging_level = request.config.getoption("--log-cli-level")
-    if backend == gs.cpu:
-        precision = "64"
-        debug = True
-    else:
-        precision = "32"
-        debug = False
+    debug = request.config.getoption("--dev")
+
+    if not taichi_offline_cache:
+        monkeypatch.setenv("TI_OFFLINE_CACHE", "0")
+        monkeypatch.setenv("GS_ENABLE_FASTCACHE", "0")
+
+    # Redirect name terrain cache directory to some test-local temporary location to avoid conflict and persistence
+    monkeypatch.setattr("genesis.utils.misc.get_gnd_cache_dir", lambda: str(tmp_path / ".cache" / "terrain"))
 
     try:
-        if not taichi_offline_cache:
-            os.environ["TI_OFFLINE_CACHE"] = "0"
-
+        # Skip if requested backend is not available
         try:
             gs.utils.get_device(backend)
         except gs.GenesisException:
             pytest.skip(f"Backend '{backend}' not available on this machine")
-        gs.init(backend=backend, precision=precision, debug=debug, seed=0, logging_level=logging_level)
-        gs.logger.addFilter(lambda record: ALLOCATE_TENSOR_WARNING not in record.getMessage())
+
+        # Skip test if not supported by this machine
+        if sys.platform == "darwin" and backend != gs.cpu:
+            if os.environ.get("TI_ENABLE_METAL", "1") != "0" and precision == "64":
+                pytest.skip("Apple Metal GPU does not support 64bits precision.")
+            if os.environ.get("GS_ENABLE_NDARRAY") == "1":
+                pytest.skip(
+                    "Using GsTaichi dynamic array type is not supported on Apple Metal GPU because this backend only "
+                    "supports up to 31 kernel parameters, which is not enough for most solvers."
+                )
+
+        gs.init(
+            backend=backend,
+            precision=precision,
+            debug=debug,
+            seed=0,
+            logging_level=logging_level,
+            performance_mode=performance_mode,
+        )
+        gc.collect()
+
+        if gs.backend != gs.cpu:
+            device_index = gs.device.index
+            if device_index is not None and device_index not in _get_gpu_indices():
+                raise RuntimeError("Wrong CUDA GPU device.")
+
         if backend != gs.cpu and gs.backend == gs.cpu:
-            gs.destroy()
             pytest.skip("No GPU available on this machine")
+
+        # Skip test if gstaichi ndarray mode is enabled but not supported by this specific test
+        if gs.use_ndarray:
+            for mark in request.node.iter_markers("field_only"):
+                if not mark.args or mark.args[0]:
+                    pytest.skip("This test does not support GsTaichi dynamic array mode. Skipping...")
+
         yield
     finally:
-        pyglet.app.exit()
         gs.destroy()
+        # Double garbage collection is over-zealous since gstaichi 2.2.1 but let's do it anyway
+        gc.collect()
         gc.collect()
 
 
@@ -393,3 +547,52 @@ def box_obj_path(asset_tmp_path, cube_verts_and_faces):
             f.write(f"f {a} {b} {c} {d}\n")
 
     return filename
+
+
+class PixelMatchSnapshotExtension(PNGImageSnapshotExtension):
+    _std_err_threshold: float = IMG_STD_ERR_THR
+    _ratio_err_threshold: float = IMG_NUM_ERR_THR
+
+    def matches(self, *, serialized_data, snapshot_data) -> bool:
+        import numpy as np
+
+        img_arrays = []
+        for data in (serialized_data, snapshot_data):
+            buffer = BytesIO()
+            buffer.write(data)
+            buffer.seek(0)
+            img_arrays.append(np.atleast_3d(np.asarray(Image.open(buffer))).astype(np.int32))
+        img_delta = np.minimum(np.abs(img_arrays[1] - img_arrays[0]), 255).astype(np.uint8)
+        if (
+            np.max(np.std(img_delta.reshape((-1, img_delta.shape[-1])), axis=0)) > self._std_err_threshold
+            and (np.abs(img_delta) > np.finfo(np.float32).eps).sum() > self._ratio_err_threshold * img_delta.size
+        ):
+            raw_bytes = BytesIO()
+            img_obj = Image.fromarray(img_delta.squeeze(-1) if img_delta.shape[-1] == 1 else img_delta)
+            img_obj.save(raw_bytes, "PNG")
+            raw_bytes.seek(0)
+            print(base64.b64encode(raw_bytes.read()))
+            return False
+        return True
+
+
+@pytest.fixture
+def png_snapshot(request, snapshot):
+    snapshot_obj = snapshot.use_extension(PixelMatchSnapshotExtension)
+    snapshot_dir = Path(PixelMatchSnapshotExtension.dirname(test_location=snapshot_obj.test_location))
+    snapshot_name = PixelMatchSnapshotExtension.get_snapshot_name(test_location=snapshot_obj.test_location)
+
+    must_update_snapshop = request.config.getoption("--snapshot-update")
+    if must_update_snapshop:
+        for path in (Path(snapshot_dir.parent) / snapshot_dir.name).glob(f"{snapshot_name}*"):
+            assert path.is_file()
+            path.unlink()
+    else:
+        from .utils import get_hf_dataset
+
+        snapshot_name_ = "".join(f"[{char}]" if char in ("[", "]") else char for char in snapshot_name)
+        get_hf_dataset(
+            pattern=f"{snapshot_dir.name}/{snapshot_name_}*", repo_name="snapshots", local_dir=snapshot_dir.parent
+        )
+
+    return snapshot_obj

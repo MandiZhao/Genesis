@@ -4,7 +4,7 @@ import threading
 import time
 
 import numpy as np
-import taichi as ti
+import gstaichi as ti
 from PIL import Image
 
 import genesis as gs
@@ -64,7 +64,11 @@ class Timer:
     def reset(self):
         self.just_reset = True
         if self.level == 0 and not self.skip:
-            print("─" * os.get_terminal_size()[0])
+            try:
+                column, _lines = os.get_terminal_size()
+            except OSError:
+                column = 80
+            print("─" * column)
         if self.ti_sync and not self.skip:
             ti.sync()
         self.prev_time = self.init_time = time.perf_counter()

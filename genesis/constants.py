@@ -1,18 +1,10 @@
 import enum
 
-import taichi as ti
+import gstaichi as ti
 
 # dynamic loading
 ACTIVE = 1
 INACTIVE = 0
-
-# misc
-EPS = None
-SEED = None
-
-# logging
-logger = None
-error_msg = None
 
 
 class IntEnum(enum.IntEnum):
@@ -82,6 +74,17 @@ class backend(IntEnum):
 
     def __format__(self, format_spec):
         return f"gs.{self.name}"
+
+
+# image types for visualization
+class IMAGE_TYPE(IntEnum):
+    RGB = 0
+    DEPTH = 1
+    SEGMENTATION = 2
+    NORMAL = 3
+
+    def __format__(self, format_spec):
+        return self.name
 
 
 GS_ARCH = {

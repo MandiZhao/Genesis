@@ -1,7 +1,12 @@
+import gstaichi as ti
+
 import genesis as gs
-import taichi as ti
 from genesis.repr_base import RBC
-import numpy as np
+
+# A constant stack size should be sufficient for BVH traversal.
+# https://madmann91.github.io/2021/01/06/bvhs-part-2.html
+# https://forums.developer.nvidia.com/t/thinking-parallel-part-ii-tree-traversal-on-the-gpu/148342
+STACK_SIZE = 64
 
 
 @ti.data_oriented
@@ -65,46 +70,58 @@ class LBVH(RBC):
     Linear BVH is a simple BVH that is used to accelerate collision detection. It supports parallel building and
     querying of the BVH tree. Only supports axis-aligned bounding boxes (AABBs).
 
+    Parameters
+    -----
+    aabbs : ti.field
+        The input AABBs to be organized in the BVH, shape (n_batches, n_aabbs).
+    max_n_query_result_per_aabb : int
+        Maximum number of query results per AABB per batch (n_batches * n_aabbs * max_n_query_result_per_aabb).
+        Defaults to 0, which means the max number of query results is 1 regardless of n_batches or n_aabbs.
+    n_radix_sort_groups : int
+        Number of groups to use for radix sort. More groups may improve performance but will use more memory.
+    max_stack_depth : int
+        Maximum stack depth for BVH traversal. Defaults to STACK_SIZE.
+
     Attributes
     -----
-        aabbs : ti.field
+    aabbs : ti.field
         The input AABBs to be organized in the BVH, shape (n_batches, n_aabbs).
-        n_aabbs : int
-            Number of AABBs per batch.
-        n_batches : int
-            Number of batches.
-        max_n_query_results : int
-            Maximum number of query results allowed.
-        max_stack_depth : int
-            Maximum stack depth for BVH traversal.
-        aabb_centers : ti.field
-            Centers of the AABBs, shape (n_batches, n_aabbs).
-        aabb_min : ti.field
-            Minimum coordinates of AABB centers per batch, shape (n_batches).
-        aabb_max : ti.field
-            Maximum coordinates of AABB centers per batch, shape (n_batches).
-        scale : ti.field
-            Scaling factors for normalizing AABB centers, shape (n_batches).
-        morton_codes : ti.field
-            Morton codes for each AABB, shape (n_batches, n_aabbs).
-        hist : ti.field
-            Histogram for radix sort, shape (n_batches, 256).
-        prefix_sum : ti.field
-            Prefix sum for histogram, shape (n_batches, 256).
-        offset : ti.field
-            Offset for radix sort, shape (n_batches, n_aabbs).
-        tmp_morton_codes : ti.field
-            Temporary storage for radix sort, shape (n_batches, n_aabbs).
-        Node : ti.dataclass
-            Node structure for the BVH tree, containing left, right, parent indices and bounding box.
-        nodes : ti.field
-            BVH nodes, shape (n_batches, n_aabbs * 2 - 1).
-        internal_node_visited : ti.field
-            Flags indicating if an internal node has been visited during traversal, shape (n_batches, n_aabbs - 1).
-        query_result : ti.field
-            Query results as a vector of (batch id, self id, query id), shape (max_n_query_results).
-        query_result_count : ti.field
-            Counter for the number of query results.
+    n_aabbs : int
+        Number of AABBs per batch.
+    n_batches : int
+        Number of batches.
+    max_query_results : int
+        Maximum number of query results allowed.
+    max_stack_depth : int
+        Maximum stack depth for BVH traversal.
+    aabb_centers : ti.field
+        Centers of the AABBs, shape (n_batches, n_aabbs).
+    aabb_min : ti.field
+        Minimum coordinates of AABB centers per batch, shape (n_batches).
+    aabb_max : ti.field
+        Maximum coordinates of AABB centers per batch, shape (n_batches).
+    scale : ti.field
+        Scaling factors for normalizing AABB centers, shape (n_batches).
+    morton_codes : ti.field
+        Morton codes for each AABB, shape (n_batches, n_aabbs).
+    hist : ti.field
+        Histogram for radix sort, shape (n_batches, 256).
+    prefix_sum : ti.field
+        Prefix sum for histogram, shape (n_batches, 256).
+    offset : ti.field
+        Offset for radix sort, shape (n_batches, n_aabbs).
+    tmp_morton_codes : ti.field
+        Temporary storage for radix sort, shape (n_batches, n_aabbs).
+    Node : ti.dataclass
+        Node structure for the BVH tree, containing left, right, parent indices and bounding box.
+    nodes : ti.field
+        BVH nodes, shape (n_batches, n_aabbs * 2 - 1).
+    internal_node_visited : ti.field
+        Flags indicating if an internal node has been visited during traversal, shape (n_batches, n_aabbs - 1).
+    query_result : ti.field
+        Query results as a vector of (batch id, self id, query id), shape (max_query_results).
+    query_result_count : ti.field
+        Counter for the number of query results.
 
     Notes
     ------
@@ -112,19 +129,28 @@ class LBVH(RBC):
         https://research.nvidia.com/sites/default/files/pubs/2012-06_Maximizing-Parallelism-in/karras2012hpg_paper.pdf
     """
 
-    def __init__(self, aabb: AABB, max_n_query_result_per_aabb: int = 8, n_radix_sort_groups: int = 256):
+    def __init__(
+        self,
+        aabb: AABB,
+        max_n_query_result_per_aabb: int = 8,
+        n_radix_sort_groups: int = 256,
+        max_stack_depth: int = STACK_SIZE,
+    ):
+        if aabb.n_aabbs < 2:
+            gs.raise_exception("The number of AABBs must be larger than 2.")
+        n_radix_sort_groups = min(aabb.n_aabbs, n_radix_sort_groups)
+
         self.aabbs = aabb.aabbs
         self.n_aabbs = aabb.n_aabbs
         self.n_batches = aabb.n_batches
 
-        # Maximum number of query results
-        self.max_n_query_results = min(self.n_aabbs * max_n_query_result_per_aabb * self.n_batches, 0x7FFFFFFF)
-        # Maximum stack depth for traversal
-        self.max_stack_depth = 64
+        self.max_query_results = max(1, min(self.n_aabbs * max_n_query_result_per_aabb * self.n_batches, 0x7FFFFFFF))
+        self.max_stack_depth = max_stack_depth
+
         self.aabb_centers = ti.field(gs.ti_vec3, shape=(self.n_batches, self.n_aabbs))
-        self.aabb_min = ti.field(gs.ti_vec3, shape=(self.n_batches))
-        self.aabb_max = ti.field(gs.ti_vec3, shape=(self.n_batches))
-        self.scale = ti.field(gs.ti_vec3, shape=(self.n_batches))
+        self.aabb_min = ti.field(gs.ti_vec3, shape=(self.n_batches,))
+        self.aabb_max = ti.field(gs.ti_vec3, shape=(self.n_batches,))
+        self.scale = ti.field(gs.ti_vec3, shape=(self.n_batches,))
         self.morton_codes = ti.field(ti.types.vector(2, ti.u32), shape=(self.n_batches, self.n_aabbs))
 
         # Histogram for radix sort
@@ -168,7 +194,7 @@ class LBVH(RBC):
         self.internal_node_ready = ti.field(gs.ti_bool, shape=(self.n_batches, self.n_aabbs - 1))
 
         # Query results, vec3 of batch id, self id, query id
-        self.query_result = ti.field(gs.ti_ivec3, shape=(self.max_n_query_results))
+        self.query_result = ti.field(gs.ti_ivec3, shape=(self.max_query_results,))
         # Count of query results
         self.query_result_count = ti.field(ti.i32, shape=())
 
@@ -235,12 +261,16 @@ class LBVH(RBC):
             self.morton_codes[i_b, i_a] = ti.Vector([morton_code, i_a], dt=ti.u32)
 
     @ti.func
-    def expand_bits(self, v):
+    def expand_bits(self, v: ti.u32) -> ti.u32:
         """
         Expands a 10-bit integer into 30 bits by inserting 2 zeros before each bit.
         """
         v = (v * ti.u32(0x00010001)) & ti.u32(0xFF0000FF)
-        v = (v * ti.u32(0x00000101)) & ti.u32(0x0F00F00F)
+        # This is to silence taichi debug warning of overflow
+        # Has the same result as v = (v * ti.u32(0x00000101)) & ti.u32(0x0F00F00F)
+        # Performance difference is negligible
+        # See https://github.com/Genesis-Embodied-AI/Genesis/pull/1560 for details
+        v = (v | ((v & 0x00FFFFFF) << 8)) & 0x0F00F00F
         v = (v * ti.u32(0x00000011)) & ti.u32(0xC30C30C3)
         v = (v * ti.u32(0x00000005)) & ti.u32(0x49249249)
         return v
@@ -277,8 +307,8 @@ class LBVH(RBC):
 
         # Reorder morton codes
         for i_b, i_a in ti.ndrange(self.n_batches, self.n_aabbs):
-            code = (self.morton_codes[i_b, i_a][1 - (i // 4)] >> ((i % 4) * 8)) & 0xFF
-            idx = ti.i32(self.offset[i_b, i_a] + self.prefix_sum[i_b, ti.i32(code)])
+            code = ti.i32((self.morton_codes[i_b, i_a][1 - (i // 4)] >> ((i % 4) * 8)) & 0xFF)
+            idx = ti.i32(self.offset[i_b, i_a] + self.prefix_sum[i_b, code])
             self.tmp_morton_codes[i_b, idx] = self.morton_codes[i_b, i_a]
 
         # Swap the temporary and original morton codes
@@ -293,11 +323,7 @@ class LBVH(RBC):
         # Fill histogram
         for i_b, i_g in ti.ndrange(self.n_batches, self.n_radix_sort_groups):
             start = i_g * self.group_size
-            end = ti.select(
-                i_g == self.n_radix_sort_groups - 1,
-                self.n_aabbs,
-                (i_g + 1) * self.group_size,
-            )
+            end = ti.select(i_g == self.n_radix_sort_groups - 1, self.n_aabbs, (i_g + 1) * self.group_size)
             for i_a in range(start, end):
                 code = ti.i32((self.morton_codes[i_b, i_a][1 - (i // 4)] >> ((i % 4) * 8)) & 0xFF)
                 self.offset[i_b, i_a] = self.hist_group[i_b, i_g, code]
@@ -351,21 +377,22 @@ class LBVH(RBC):
 
             delta_min = self.delta(i, i - d, i_b)
             l_max = ti.u32(2)
-            while self.delta(i, i + l_max * d, i_b) > delta_min:
+            while self.delta(i, i + ti.i32(l_max) * d, i_b) > delta_min:
                 l_max *= 2
-            l = ti.u32(0)
 
+            l = ti.u32(0)
             t = l_max // 2
             while t > 0:
-                if self.delta(i, i + (l + t) * d, i_b) > delta_min:
+                if self.delta(i, i + ti.i32(l + t) * d, i_b) > delta_min:
                     l += t
                 t //= 2
-            j = i + l * d
+
+            j = i + ti.i32(l) * d
             delta_node = self.delta(i, j, i_b)
             s = ti.u32(0)
             t = (l + 1) // 2
             while t > 0:
-                if self.delta(i, i + (s + t) * d, i_b) > delta_node:
+                if self.delta(i, i + ti.i32(s + t) * d, i_b) > delta_node:
                     s += t
                 t = ti.select(t > 1, (t + 1) // 2, 0)
 
@@ -378,7 +405,7 @@ class LBVH(RBC):
             self.nodes[i_b, ti.i32(right)].parent = i
 
     @ti.func
-    def delta(self, i, j, i_b):
+    def delta(self, i: ti.i32, j: ti.i32, i_b: ti.i32):
         """
         Compute the longest common prefix (LCP) of the morton codes of two AABBs.
         """
@@ -386,9 +413,9 @@ class LBVH(RBC):
         if j >= 0 and j < self.n_aabbs:
             result = 64
             for i_bit in range(2):
-                x = self.morton_codes[i_b, ti.i32(i)][i_bit] ^ self.morton_codes[i_b, ti.i32(j)][i_bit]
+                x = self.morton_codes[i_b, i][i_bit] ^ self.morton_codes[i_b, j][i_bit]
                 for b in range(32):
-                    if x & (1 << (31 - b)):
+                    if x & (ti.u32(1) << (31 - b)):
                         result = b + 32 * i_bit
                         break
                 if result != 64:
@@ -441,7 +468,7 @@ class LBVH(RBC):
 
         return is_done
 
-    @ti.kernel
+    @ti.func
     def query(self, aabbs: ti.template()):
         """
         Query the BVH for intersections with the given AABBs.
@@ -449,10 +476,11 @@ class LBVH(RBC):
         The results are stored in the query_result field.
         """
         self.query_result_count[None] = 0
+        overflow = False
 
         n_querys = aabbs.shape[1]
         for i_b, i_q in ti.ndrange(self.n_batches, n_querys):
-            query_stack = ti.Vector.zero(ti.i32, 64)
+            query_stack = ti.Vector.zero(ti.i32, self.max_stack_depth)
             stack_depth = 1
 
             while stack_depth > 0:
@@ -468,8 +496,10 @@ class LBVH(RBC):
                         if self.filter(i_a, i_q):
                             continue
                         idx = ti.atomic_add(self.query_result_count[None], 1)
-                        if idx < self.max_n_query_results:
+                        if idx < self.max_query_results:
                             self.query_result[idx] = gs.ti_ivec3(i_b, i_a, i_q)  # Store the AABB index
+                        else:
+                            overflow = True
                     else:
                         # Push children onto the stack
                         if node.right != -1:
@@ -478,6 +508,8 @@ class LBVH(RBC):
                         if node.left != -1:
                             query_stack[stack_depth] = node.left
                             stack_depth += 1
+
+        return overflow
 
 
 @ti.data_oriented
@@ -499,10 +531,13 @@ class FEMSurfaceTetLBVH(LBVH):
 
         This is used to avoid self-collisions in FEM surface tets.
 
-        i_a: index of the found AABB
-        i_q: index of the query AABB
+        Parameters
+        ----------
+        i_a:
+            index of the found AABB
+        i_q:
+            index of the query AABB
         """
-
         result = i_a >= i_q
         i_av = self.fem_solver.elements_i[self.fem_solver.surface_elements[i_a]].el2v
         i_qv = self.fem_solver.elements_i[self.fem_solver.surface_elements[i_q]].el2v
@@ -510,3 +545,28 @@ class FEMSurfaceTetLBVH(LBVH):
             if i_av[i] == i_qv[j]:
                 result = True
         return result
+
+
+@ti.data_oriented
+class RigidTetLBVH(LBVH):
+    """
+    RigidTetLBVH is a specialized Linear BVH for rigid tetrahedrals.
+    It extends the LBVH class to support filtering based on rigid tetrahedral elements.
+    """
+
+    def __init__(self, coupler, aabb: AABB, max_n_query_result_per_aabb: int = 8, n_radix_sort_groups: int = 256):
+        super().__init__(aabb, max_n_query_result_per_aabb, n_radix_sort_groups)
+        self.coupler = coupler
+        self.rigid_solver = coupler.rigid_solver
+
+    @ti.func
+    def filter(self, i_a, i_q):
+        """
+        Filter function for Rigid tets. Filter out tet that belong to the same link
+
+        i_a: index of the found AABB
+        i_q: index of the query AABB
+        """
+        i_ag = self.coupler.rigid_volume_elems_geom_idx[i_a]
+        i_qg = self.coupler.rigid_volume_elems_geom_idx[i_q]
+        return not self.coupler.rigid_collision_pair_validity[i_ag, i_qg]

@@ -11,7 +11,7 @@ def main():
     args = parser.parse_args()
 
     ########################## init ##########################
-    gs.init(seed=0, precision="32", logging_level="debug")
+    gs.init(precision="32", logging_level="info")
 
     ########################## create a scene ##########################
 
@@ -67,7 +67,7 @@ def main():
             vis_mode="particle",
         ),
     )
-    scene.build(n_envs=5)
+    scene.build(n_envs=2)
 
     horizon = 400
     for i in range(horizon):

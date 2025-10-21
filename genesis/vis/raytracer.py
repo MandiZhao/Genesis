@@ -2,6 +2,7 @@ import os
 import sys
 
 import numpy as np
+import trimesh
 
 import genesis as gs
 import genesis.utils.geom as gu
@@ -9,14 +10,12 @@ import genesis.utils.mesh as mu
 import genesis.utils.misc as miscu
 import genesis.utils.particle as pu
 from genesis.engine import entities
-import trimesh
 
-LRP_PATH = os.path.join(miscu.get_src_dir(), "ext/LuisaRender/build/bin")
 try:
-    sys.path.append(LRP_PATH)
+    sys.path.append(os.path.join(miscu.get_src_dir(), "ext/LuisaRender/build/bin"))
     import LuisaRenderPy
 except ImportError as e:
-    gs.raise_exception(f"Failed to import LuisaRenderer. {e.__class__.__name__}: {e}")
+    gs.raise_exception_from(f"Failed to import LuisaRenderer.", e)
 
 logging_class = {
     "debug": LuisaRenderPy.LogLevel.DEBUG,
@@ -157,29 +156,21 @@ class Raytracer:
         self.lights = []
         for light in options.lights:
             light_intensity = light.get("intensity", 1.0)
-            self.lights.append(
-                SphereLight(
-                    radius=light["radius"],
-                    pos=light["pos"],
-                    surface=gs.surfaces.Emission(
-                        color=(
-                            light["color"][0] * light_intensity,
-                            light["color"][1] * light_intensity,
-                            light["color"][2] * light_intensity,
-                        ),
-                    ),
-                )
+            light_surface = gs.surfaces.Emission(
+                color=map(lambda x: x * light_intensity, light["color"]),
             )
+            light_surface.update_texture()
+            self.lights.append(SphereLight(radius=light["radius"], pos=light["pos"], surface=light_surface))
 
         LuisaRenderPy.init(
-            context_path=LRP_PATH,
+            context_path=os.path.dirname(LuisaRenderPy.__file__),
             context_id=str(gs.UID()),
             backend="cuda" if gs.platform != "macOS" else "metal",
             device_index=self.device_index,
             log_level=logging_class[self.logging_level],
         )
 
-    def add_mesh_light(self, mesh, color, intensity, pos, quat, revert_dir=False, double_sided=False, beam_angle=180.0):
+    def add_mesh_light(self, mesh, color, intensity, pos, quat, revert_dir=False, double_sided=False, cutoff=180.0):
         color = np.array(color)
         if color.ndim != 1 or (color.shape[0] != 3 and color.shape[0] != 4):
             gs.raise_exception("Light color should have shape (3,) or (4,).")
@@ -196,7 +187,7 @@ class Raytracer:
                         color[2] * intensity,
                     ),
                     double_sided=double_sided,
-                    beam_angle=beam_angle,
+                    cutoff=cutoff,
                 ),
                 name=str(mesh.uid),
                 revert_dir=revert_dir,
@@ -247,7 +238,7 @@ class Raytracer:
                 self.add_surface(str(entity.uid), entity.surface)
 
         # tool entities
-        if self.sim.tool_solver.is_active():
+        if self.sim.tool_solver.is_active:
             for tool_entity in self.sim.tool_solver.entities:
                 self.add_rigid(
                     name=str(tool_entity.uid),
@@ -258,7 +249,7 @@ class Raytracer:
                 )
 
         # rigid entities
-        if self.sim.rigid_solver.is_active():
+        if self.sim.rigid_solver.is_active:
             for rigid_entity in self.sim.rigid_solver.entities:
                 if rigid_entity.surface.vis_mode == "visual":
                     geoms = rigid_entity.vgeoms
@@ -279,7 +270,7 @@ class Raytracer:
                     )
 
         # avatar entities
-        if self.sim.avatar_solver.is_active():
+        if self.sim.avatar_solver.is_active:
             for avatar_entity in self.sim.avatar_solver.entities:
                 if avatar_entity.surface.vis_mode == "visual":
                     geoms = avatar_entity.vgeoms
@@ -300,7 +291,7 @@ class Raytracer:
                     )
 
         # MPM particles
-        if self.sim.mpm_solver.is_active():
+        if self.sim.mpm_solver.is_active:
             for mpm_entity in self.sim.mpm_solver.entities:
                 if mpm_entity.surface.vis_mode == "visual":
                     self.add_deformable(str(mpm_entity.uid))
@@ -310,12 +301,12 @@ class Raytracer:
                     )
 
         # SPH particles
-        if self.sim.sph_solver.is_active():
+        if self.sim.sph_solver.is_active:
             for sph_entity in self.sim.sph_solver.entities:
                 self.add_particles(str(sph_entity.uid), self.sim.sph_solver.particle_radius, sph_entity.material.rho)
 
         # PBD entities
-        if self.sim.pbd_solver.is_active():
+        if self.sim.pbd_solver.is_active:
             for pbd_entity in self.sim.pbd_solver.entities:
                 if pbd_entity.surface.vis_mode == "visual":
                     self.add_deformable(str(pbd_entity.uid))
@@ -328,12 +319,10 @@ class Raytracer:
                         self.add_deformable(str(pbd_entity.uid))
 
         # FEM entities
-        if self.sim.fem_solver.is_active():
+        if self.sim.fem_solver.is_active:
             for fem_entity in self.sim.fem_solver.entities:
                 if fem_entity.surface.vis_mode == "visual":
                     self.add_deformable(str(fem_entity.id))
-
-        gs.exit_callbacks.append(self.destroy)
 
     def get_transform(self, matrix):
         if matrix is None:
@@ -375,7 +364,7 @@ class Raytracer:
                 name=f"emis_{shape_name}",
                 emission=self.get_texture(surface.get_emission()),
                 two_sided=False if surface.double_sided is None else surface.double_sided,
-                beam_angle=surface.beam_angle,
+                beam_angle=surface.cutoff,
             )
             self._scene.update_emission(emission_luisa)
         else:
@@ -604,7 +593,7 @@ class Raytracer:
         if camera_model == "pinhole":
             self._cameras[camera_name] = LuisaRenderPy.PinholeCamera(
                 name=camera_name,
-                pose=self.get_transform(camera.transform),
+                pose=self.get_transform(np.eye(4)),
                 film=LuisaRenderPy.Film(resolution=camera.res),
                 filter=LuisaRenderPy.Filter(),
                 spp=camera.spp,
@@ -613,7 +602,7 @@ class Raytracer:
         elif camera_model == "thinlens":
             self._cameras[camera_name] = LuisaRenderPy.ThinLensCamera(
                 name=camera_name,
-                pose=self.get_transform(camera.transform),
+                pose=self.get_transform(np.eye(4)),
                 film=LuisaRenderPy.Film(resolution=camera.res),
                 filter=LuisaRenderPy.Filter(),
                 spp=camera.spp,
@@ -629,12 +618,13 @@ class Raytracer:
     def update_camera(self, camera):
         camera_name = str(camera.uid)
         camera_model = camera.model
+        camera_transform = camera.transform
 
         if camera_model == "pinhole":
-            self._cameras[camera_name].update(pose=self.get_transform(camera.transform), fov=camera.fov)
+            self._cameras[camera_name].update(pose=self.get_transform(camera_transform), fov=camera.fov)
         elif camera_model == "thinlens":
             self._cameras[camera_name].update(
-                pose=self.get_transform(camera.transform),
+                pose=self.get_transform(camera_transform),
                 aperture=camera.aperture,
                 focal_len=camera.focal_len * 1000,
                 focus_dis=camera.focus_dist,
@@ -648,8 +638,8 @@ class Raytracer:
     def reset(self):
         self._t = -1
 
-    def update_scene(self):
-        if self._t >= self.scene.t:
+    def update_scene(self, force_render: bool = False):
+        if not force_render and self._t >= self.scene.t:
             if self.camera_updated:
                 self._scene.update_scene(time=self._t)
                 self.camera_updated = False
@@ -659,10 +649,10 @@ class Raytracer:
         self._t = self.scene.t
 
         # update variables not used in simulation
-        self.visualizer.update_visual_states()
+        self.visualizer.update_visual_states(force_render)
 
         # tool entities
-        if self.sim.tool_solver.is_active():
+        if self.sim.tool_solver.is_active:
             for tool_entity in self.sim.tool_solver.entities:
                 pos = tool_entity.pos[self.sim.cur_substep_local].to_numpy()
                 quat = tool_entity.quat[self.sim.cur_substep_local].to_numpy()
@@ -670,7 +660,7 @@ class Raytracer:
                 self.update_rigid(str(tool_entity.uid), T)
 
         # rigid entities
-        if self.sim.rigid_solver.is_active():
+        if self.sim.rigid_solver.is_active:
             for rigid_entity in self.sim.rigid_solver.entities:
                 if rigid_entity.surface.vis_mode == "visual":
                     geoms = rigid_entity.vgeoms
@@ -684,7 +674,7 @@ class Raytracer:
                     self.update_rigid_batch(str(geom.uid), geom_T)
 
         # avatar entities
-        if self.sim.avatar_solver.is_active():
+        if self.sim.avatar_solver.is_active:
             for avatar_entity in self.sim.avatar_solver.entities:
                 if avatar_entity.surface.vis_mode == "visual":
                     geoms = avatar_entity.vgeoms
@@ -698,7 +688,7 @@ class Raytracer:
                     self.update_rigid_batch(str(geom.uid), geom_T)
 
         # MPM particles
-        if self.sim.mpm_solver.is_active():
+        if self.sim.mpm_solver.is_active:
             particles_all = self.sim.mpm_solver.particles_render.pos.to_numpy()[:, self.rendered_envs_idx[0]]
             particles_vel_all = self.sim.mpm_solver.particles_render.vel.to_numpy()[:, self.rendered_envs_idx[0]]
             active_all = self.sim.mpm_solver.particles_render.active.to_numpy().astype(bool)[
@@ -729,7 +719,7 @@ class Raytracer:
                     )
 
         # SPH particles
-        if self.sim.sph_solver.is_active():
+        if self.sim.sph_solver.is_active:
             particles_all = self.sim.sph_solver.particles_render.pos.to_numpy()[:, self.rendered_envs_idx[0]]
             particles_vel_all = self.sim.sph_solver.particles_render.vel.to_numpy()[:, self.rendered_envs_idx[0]]
             active_all = self.sim.sph_solver.particles_render.active.to_numpy().astype(bool)[
@@ -748,7 +738,7 @@ class Raytracer:
                 )
 
         # PBD entities
-        if self.sim.pbd_solver.is_active():
+        if self.sim.pbd_solver.is_active:
             idx = self.rendered_envs_idx[0]
             particles_all = self.sim.pbd_solver.particles_render.pos.to_numpy()[:, idx]
             particles_vel_all = self.sim.pbd_solver.particles_render.vel.to_numpy()[:, idx]
@@ -789,7 +779,7 @@ class Raytracer:
                         )
 
         # FEM entities
-        if self.sim.fem_solver.is_active():
+        if self.sim.fem_solver.is_active:
             vertices_all, triangles_all = self.sim.fem_solver.get_state_render(self.sim.cur_substep_local)
             vertices_all = vertices_all.to_numpy()[:, self.rendered_envs_idx[0]]
             triangles_all = triangles_all.to_numpy()

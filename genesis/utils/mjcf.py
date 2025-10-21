@@ -44,9 +44,23 @@ def build_model(xml, discard_visual, default_armature=None, merge_fixed_links=Fa
         # Detect whether it is a URDF file or a Mujoco MJCF file
         root = xml.getroot()
         is_urdf_file = root.tag == "robot"
+        mjcf = ET.SubElement(root, "mujoco") if is_urdf_file else root
+
+        # Parse all included sub-models recursively
+        root_parent_stack = [(mjcf, Path(""))]
+        while root_parent_stack:
+            xml_root, parent_path = root_parent_stack.pop()
+            for elem in tuple(xml_root.findall("include")):
+                include_path = parent_path / elem.attrib["file"]
+                include_root = ET.parse(Path(asset_path) / include_path).getroot()
+                for include_elem in include_root.findall(".//mesh"):
+                    include_elem.attrib["file"] = str(include_path.parent / include_elem.attrib["file"])
+                for child in include_root:
+                    mjcf.append(child)
+                mjcf.remove(elem)
+                root_parent_stack.append((include_root, include_path))
 
         # Make sure compiler options are defined
-        mjcf = ET.SubElement(root, "mujoco") if is_urdf_file else root
         compiler = mjcf.find("compiler")
         if compiler is None:
             compiler = ET.SubElement(mjcf, "compiler")
@@ -107,7 +121,7 @@ def build_model(xml, discard_visual, default_armature=None, merge_fixed_links=Fa
                 mesh_path = elem.get("filename")
                 if mesh_path.startswith("package://"):
                     mesh_path = mesh_path[10:]
-                elem.set("filename", os.path.abspath(os.path.join(asset_path, mesh_path)))
+                elem.set("filename", str((Path(asset_path) / mesh_path).resolve()))
 
         with open(os.devnull, "w") as stderr, redirect_libc_stderr(stderr):
             # Parse updated URDF file as a string
@@ -257,7 +271,6 @@ def parse_link(mj, i_l, scale):
             j_info["dofs_motion_vel"] = np.eye(6, 3)
             j_info["dofs_limit"] = np.tile([-np.inf, np.inf], (6, 1))
             j_info["dofs_stiffness"] = np.zeros(6)
-
             j_info["init_qpos"][:3] *= scale
         elif gs_type == gs.JOINT_TYPE.SPHERICAL:
             if mj_is_limited:
@@ -281,7 +294,6 @@ def parse_link(mj, i_l, scale):
                 j_info["dofs_motion_vel"] = np.array([mj_axis])
                 j_info["dofs_limit"] = np.array([mj_limit]) * scale
                 j_info["dofs_stiffness"] = np.array([mj_stiffness])
-
                 j_info["init_qpos"] *= scale
 
         # Parsing actuator parameters
@@ -360,14 +372,19 @@ def parse_link(mj, i_l, scale):
 
         j_infos.append(j_info)
 
-    # Applying scale
-    l_info["pos"] *= scale
-    l_info["inertial_pos"] *= scale
-    l_info["inertial_mass"] *= scale**3
-    l_info["inertial_i"] *= scale**5
-    l_info["invweight"] /= scale**3
-    for j_info in j_infos:
-        j_info["pos"] *= scale
+    # Applying scale if necessary.
+    # Note that the mass matrix of a poly-articulated robot does not scale trivially as it is a copnfiguration-depends
+    # mixing of s ** 3 factor for masses and s ** 5 factor for inertia tensors. As a result, it is much simpler to
+    # consider invweight indefined, which will trigger recomputation at build time.
+    if abs(1.0 - scale) > gs.EPS:
+        l_info["pos"] *= scale
+        l_info["inertial_pos"] *= scale
+        l_info["inertial_mass"] *= scale**3
+        l_info["inertial_i"] *= scale**5
+        l_info["invweight"][:] = -1.0
+        for j_info in j_infos:
+            j_info["pos"] *= scale
+            j_info["dofs_invweight"][:] = -1.0
 
     return l_info, j_infos
 
@@ -420,7 +437,7 @@ def parse_geom(mj, i_g, scale, surface, xml_path):
         else:
             tmesh = trimesh.creation.icosphere(radius=radius)
         gs_type = gs.GEOM_TYPE.SPHERE
-        geom_data = np.array([radius])
+        geom_data = np.array([radius * scale])
 
     elif mj_geom.type == mujoco.mjtGeom.mjGEOM_ELLIPSOID:
         if is_col:
@@ -429,7 +446,7 @@ def parse_geom(mj, i_g, scale, surface, xml_path):
             tmesh = trimesh.creation.icosphere(radius=1.0)
         tmesh.apply_transform(np.diag([*geom_size, 1]))
         gs_type = gs.GEOM_TYPE.ELLIPSOID
-        geom_data = geom_size
+        geom_data = geom_size * scale
 
     elif mj_geom.type == mujoco.mjtGeom.mjGEOM_CAPSULE:
         radius = geom_size[0]
@@ -439,14 +456,14 @@ def parse_geom(mj, i_g, scale, surface, xml_path):
         else:
             tmesh = trimesh.creation.capsule(radius=radius, height=height)
         gs_type = gs.GEOM_TYPE.CAPSULE
-        geom_data = np.array([radius, height])
+        geom_data = np.array([radius * scale, height * scale])
 
     elif mj_geom.type == mujoco.mjtGeom.mjGEOM_CYLINDER:
         radius = geom_size[0]
         height = geom_size[1] * 2
         tmesh = trimesh.creation.cylinder(radius=radius, height=height)
         gs_type = gs.GEOM_TYPE.CYLINDER
-        geom_data = np.array([radius, height])
+        geom_data = np.array([radius * scale, height * scale])
 
     elif mj_geom.type == mujoco.mjtGeom.mjGEOM_BOX:
         tmesh = trimesh.creation.box(extents=geom_size * 2)
@@ -467,7 +484,7 @@ def parse_geom(mj, i_g, scale, surface, xml_path):
                 uv_coordinates = uv_coordinates * mj_mat.texrepeat
                 visual = TextureVisuals(uv=uv_coordinates, image=Image.fromarray(image_array))
                 tmesh.visual = visual
-        geom_data = 2 * geom_size
+        geom_data = 2 * geom_size * scale
 
     elif mj_geom.type == mujoco.mjtGeom.mjGEOM_MESH:
         mj_mesh = mj.mesh(mj_geom.dataid[0])
@@ -656,15 +673,22 @@ def parse_geoms(mj, scale, surface, xml_path):
             "when calling `scene.add_entity`."
         )
 
-    # Parse geometry group if available.
-    # Duplicate collision geometries as visual for bodies not having dedicated visual geometries as a fallback.
+    # Parse geometry group if available
     for link_g_info in links_g_info:
         has_visual_group = any(g_info["group"] > 0 for g_info in link_g_info)
-        is_all_col = all(g_info["contype"] or g_info["conaffinity"] for g_info in link_g_info)
         for g_info in link_g_info.copy():
-            group = g_info.pop("group")
-            is_col = g_info["contype"] or g_info["conaffinity"]
-            if (has_visual_group and group in (1, 2) and is_col) or (not has_visual_group and is_all_col):
+            # Duplicate collision geometries as visual in accordance with Mujoco logics
+            create_visual = False
+            if g_info["contype"] or g_info["conaffinity"]:
+                if has_visual_group:
+                    # If groups are defined, only create visual for geoms in visual groups (1 or 2)
+                    create_visual = g_info["group"] in (1, 2)
+                else:
+                    # If no groups defined, always create visual duplicates for collision geoms.
+                    # This handles the case where we have a mix of collision and non-collision geoms.
+                    create_visual = True
+
+            if create_visual:
                 g_info = g_info.copy()
                 mesh = g_info.pop("mesh")
                 vmesh = gs.Mesh(

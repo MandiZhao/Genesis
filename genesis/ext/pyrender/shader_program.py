@@ -135,8 +135,11 @@ class ShaderProgram(object):
 
     def _remove_from_context(self):
         if self._program_id is not None:
-            glDeleteProgram(self._program_id)
-            glDeleteVertexArrays(1, [self._vao_id])
+            try:
+                glDeleteProgram(self._program_id)
+                glDeleteVertexArrays(1, [self._vao_id])
+            except OpenGL.error.Error:
+                pass
             self._program_id = None
             self._vao_id = None
 
@@ -223,7 +226,7 @@ class ShaderProgram(object):
         # Call correct uniform function
         elif isinstance(value, (numbers.Real, np.floating)):
             glUniform1f(loc, float(value))
-        elif isinstance(value, (numbers.Integer, np.integer)):
+        elif isinstance(value, (numbers.Integral, np.integer)):
             if unsigned:
                 glUniform1ui(loc, int(value))
             else:

@@ -1,4 +1,4 @@
-import taichi as ti
+import gstaichi as ti
 
 import genesis as gs
 
@@ -12,7 +12,8 @@ class ElastoPlastic(Base):
 
     Note
     ----
-    Default yield ratio comes from the SNOW material in taichi's MPM implementation: https://github.com/taichi-dev/taichi_elements/blob/d19678869a28b09a32ef415b162e35dc929b792d/engine/mpm_solver.py#L434
+    Default yield ratio comes from the SNOW material in taichi's MPM implementation:
+    https://github.com/taichi-dev/taichi_elements/blob/d19678869a28b09a32ef415b162e35dc929b792d/engine/mpm_solver.py#L434
 
     Parameters
     ----------
@@ -27,7 +28,8 @@ class ElastoPlastic(Base):
     mu: float, optional
         The second Lame's parameter. Default is None, computed by E and nu.
     sampler: str, optional
-        Particle sampler ('pbs', 'regular', 'random'). Default is 'pbs'.
+        Particle sampler ('pbs', 'regular', 'random'). Note that 'pbs' is only supported on Linux for now. Defaults to
+        'pbs' on supported platforms, 'random' otherwise.
     yield_lower: float, optional
         Lower bound for the yield clamp (ignored if using von Mises). Default is 2.5e-2.
     yield_higher: float, optional
@@ -45,12 +47,15 @@ class ElastoPlastic(Base):
         rho=1000.0,  # density (kg/m^3)
         lam=None,
         mu=None,
-        sampler="pbs",
+        sampler=None,
         yield_lower=2.5e-2,
         yield_higher=4.5e-3,
         use_von_mises=True,  # von Mises yield criterion
         von_mises_yield_stress=10000.0,
     ):
+        if sampler is None:
+            sampler = "pbs" if gs.platform == "Linux" else "random"
+
         super().__init__(E, nu, rho, lam, mu, sampler)
 
         self._yield_lower = yield_lower
