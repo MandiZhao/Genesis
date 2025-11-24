@@ -836,6 +836,7 @@ class RigidEntity(Entity):
         max_step_size=0.5,
         dofs_idx_local=None,
         return_error=False,
+        envs_idx=None,
     ):
         """
         Compute inverse kinematics for  multiple target links.
@@ -1016,6 +1017,9 @@ class RigidEntity(Entity):
         qpos = self._IK_qpos_best.to_torch(gs.device).permute(1, 0)
         if self._solver.n_envs == 0:
             qpos = qpos.squeeze(0)
+
+        if envs_idx is not None and self._solver.n_envs > 0:
+            qpos = qpos[envs_idx]
 
         if return_error:
             error_pose = (

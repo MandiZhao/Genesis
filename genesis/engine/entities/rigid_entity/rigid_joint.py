@@ -293,6 +293,13 @@ class RigidJoint(RBC):
             return [dof_idx - self._entity._dof_start for dof_idx in self.dof_idx]
 
     @property
+    def dofs_idx_local(self):
+        """
+        Returns the local Degrees of Freedom indices of the joint in the entity.
+        """
+        return list(range(self.dof_start - self._entity.dof_start, self.dof_end - self._entity.dof_start))
+
+    @property
     def q_idx(self):
         """
         Returns all the `q` indices of the joint in the rigid solver.
