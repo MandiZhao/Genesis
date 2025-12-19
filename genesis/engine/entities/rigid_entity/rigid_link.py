@@ -372,7 +372,8 @@ class RigidLink(RBC):
         Set the mass of the link.
         """
         if self.is_fixed:
-            gs.warning(f"Updating the mass of a link that is fixed wrt world has no effect, skipping.")
+            # gs.warning(f"Updating the mass of a link that is fixed wrt world has no effect, skipping.")
+            print(f"WARNING Updating the mass of a link that is fixed wrt world has no effect, skipping.")
             return
 
         if mass < gs.EPS:
