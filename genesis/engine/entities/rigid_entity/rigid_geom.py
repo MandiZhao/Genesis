@@ -8,22 +8,23 @@ import numpy as np
 import skimage
 import torch
 import trimesh
-from numpy.typing import NDArray
 
 import genesis as gs
-import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 import genesis.utils.mesh as mu
 from genesis.repr_base import RBC
-from genesis.utils.misc import tensor_to_array
+from genesis.utils.misc import tensor_to_array, ti_to_torch, DeprecationError
 
 if TYPE_CHECKING:
-    from genesis.engine.solvers.rigid.rigid_solver_decomp import RigidSolver
     from genesis.engine.materials.rigid import Rigid as RigidMaterial
     from genesis.engine.mesh import Mesh
+    from genesis.engine.solvers.rigid.rigid_solver import RigidSolver
 
     from .rigid_entity import RigidEntity
     from .rigid_link import RigidLink
+
+
+NUM_VERTS_VISUAL_GEOM_AABB = 200
 
 
 @ti.data_oriented
@@ -65,8 +66,8 @@ class RigidGeom(RBC):
         self._friction: float = friction
         self._sol_params = sol_params
         self._needs_coup: bool = needs_coup
-        self._contype = contype
-        self._conaffinity = conaffinity
+        self._contype = int(contype)
+        self._conaffinity = int(conaffinity)
         self._is_convex: bool = mesh.is_convex
         self._cell_start: int = cell_start
         self._vert_start: int = vert_start
@@ -80,6 +81,10 @@ class RigidGeom(RBC):
 
         self._init_pos: np.ndarray = init_pos
         self._init_quat: np.ndarray = init_quat
+
+        # For heterogeneous simulation: which environments this geom is active in (None = all envs)
+        self.active_envs_mask: torch.Tensor | None = None
+        self.active_envs_idx: np.ndarray | None = None
 
         self._init_verts = mesh.verts
         self._init_faces = mesh.faces
@@ -139,7 +144,7 @@ class RigidGeom(RBC):
                 with open(self._gsd_path, "rb") as file:
                     gsd_dict = pkl.load(file)
                 is_cached_loaded = True
-            except (EOFError, ModuleNotFoundError, pkl.UnpicklingError):
+            except (EOFError, ModuleNotFoundError, pkl.UnpicklingError, TypeError, MemoryError):
                 gs.logger.info("Ignoring corrupted cache.")
 
         if not is_cached_loaded:
@@ -348,7 +353,7 @@ class RigidGeom(RBC):
             gs.raise_exception("`friction` must be non-negative.")
         self._friction = friction
 
-        if self.is_built:
+        if self._solver.is_built:
             self._solver.set_geom_friction(friction, self._idx)
 
     # ------------------------------------------------------------------------------------
@@ -356,43 +361,35 @@ class RigidGeom(RBC):
     # ------------------------------------------------------------------------------------
 
     @gs.assert_built
-    def get_pos(self):
+    def get_pos(self, envs_idx=None):
         """
         Get the position of the geom in world frame.
         """
-        tensor = torch.empty(self._solver._batch_shape(3, True), dtype=gs.tc_float, device=gs.device)
-        _kernel_get_geoms_pos(tensor, self._idx, self._solver.geoms_state)
-        if self._solver.n_envs == 0:
-            tensor = tensor.squeeze(0)
-        return tensor
+        tensor = ti_to_torch(self._solver.geoms_state.pos, envs_idx, self._idx, transpose=True, copy=True)[..., 0, :]
+        return tensor[0] if self._solver.n_envs == 0 else tensor
 
     @gs.assert_built
-    def get_quat(self):
+    def get_quat(self, envs_idx=None):
         """
         Get the quaternion of the geom in world frame.
         """
-        tensor = torch.empty(self._solver._batch_shape(4, True), dtype=gs.tc_float, device=gs.device)
-        _kernel_get_geoms_quat(tensor, self._idx, self._solver.geoms_state)
-        if self._solver.n_envs == 0:
-            tensor = tensor.squeeze(0)
-        return tensor
+        tensor = ti_to_torch(self._solver.geoms_state.quat, envs_idx, self._idx, transpose=True, copy=True)[..., 0, :]
+        return tensor[0] if self._solver.n_envs == 0 else tensor
 
     @gs.assert_built
     def get_verts(self):
         """
         Get the vertices of the geom in world frame.
         """
-        self._solver.update_verts_for_geom(self._idx)
-        if self.is_free:
-            tensor = torch.empty(
-                self._solver._batch_shape((self.n_verts, 3), True), dtype=gs.tc_float, device=gs.device
-            )
-            _kernel_get_free_verts(tensor, self._verts_state_start, self.n_verts, self._solver.free_verts_state)
-            if self._solver.n_envs == 0:
-                tensor = tensor.squeeze(0)
+        self._solver.update_verts_for_geoms(self._idx)
+
+        verts_idx = slice(self.verts_state_start, self.verts_state_end)
+        if self.is_fixed and not self._entity._batch_fixed_verts:
+            tensor = ti_to_torch(self._solver.fixed_verts_state.pos, verts_idx, copy=True)
         else:
-            tensor = torch.empty((self.n_verts, 3), dtype=gs.tc_float, device=gs.device)
-            _kernel_get_fixed_verts(tensor, self._verts_state_start, self.n_verts, self._solver.fixed_verts_state)
+            tensor = ti_to_torch(self._solver.free_verts_state.pos, None, verts_idx, transpose=True, copy=True)
+            if self._solver.n_envs == 0:
+                tensor = tensor[0]
         return tensor
 
     @gs.assert_built
@@ -401,18 +398,14 @@ class RigidGeom(RBC):
         Get the axis-aligned bounding box (AABB) of the geom in world frame.
         """
         verts = self.get_verts()
-        AABB = torch.concatenate(
-            [verts.min(axis=-2, keepdim=True)[0], verts.max(axis=-2, keepdim=True)[0]],
-            axis=-2,
-        )
-        return AABB
+        return torch.stack((verts.min(dim=-2).values, verts.max(dim=-2).values), dim=-2)
 
     def set_sol_params(self, sol_params):
         """
         Set the solver parameters of this geometry.
         """
-        if self.is_built:
-            self._solver.set_sol_params(sol_params[None], geoms_idx=self._idx, envs_idx=None, unsafe=False)
+        if self._solver.is_built:
+            self._solver.set_sol_params(sol_params, geoms_idx=self._idx, envs_idx=None)
         else:
             self._sol_params = sol_params
 
@@ -421,8 +414,8 @@ class RigidGeom(RBC):
         """
         Get the solver parameters of this geometry.
         """
-        if self.is_built:
-            return self._solver.get_sol_params(geoms_idx=self._idx, envs_idx=None, unsafe=True)[0]
+        if self._solver.is_built:
+            return self._solver.get_sol_params(geoms_idx=self._idx, envs_idx=None)[0]
         return self._sol_params
 
     # ------------------------------------------------------------------------------------
@@ -511,7 +504,7 @@ class RigidGeom(RBC):
         return self._needs_coup
 
     @property
-    def contype(self):
+    def contype(self) -> int:
         """
         Get the contact type of the geometry for collision pair filtering.
 
@@ -523,7 +516,7 @@ class RigidGeom(RBC):
         return self._contype
 
     @property
-    def conaffinity(self):
+    def conaffinity(self) -> int:
         """
         Get the contact affinity of the geometry for collision pair filtering.
 
@@ -806,10 +799,14 @@ class RigidGeom(RBC):
 
     @property
     def is_free(self):
+        raise DeprecationError("This property has been removed.")
+
+    @property
+    def is_fixed(self) -> bool:
         """
-        Whether the rigid entity the vgeom belongs to is free.
+        Whether this geom is fixed in the world.
         """
-        return self.entity.is_free
+        return self.link.is_fixed
 
     # ------------------------------------------------------------------------------------
     # -------------------------------------- repr ----------------------------------------
@@ -841,6 +838,11 @@ class RigidVisGeom(RBC):
         self._solver = link.entity.solver
         self._vmesh = vmesh
 
+        # Lazy-initialize low-res geometry because it is usually unused and may be slow to compute
+        self._init_pos_tc = torch.from_numpy(init_pos).to(device=gs.device, dtype=gs.tc_float)
+        self._init_quat_tc = torch.from_numpy(init_quat).to(device=gs.device, dtype=gs.tc_float)
+        self._aabb_verts: torch.Tensor | None = None
+
         self._uid = gs.UID()
         self._idx = idx
 
@@ -849,6 +851,10 @@ class RigidVisGeom(RBC):
 
         self._init_pos = init_pos
         self._init_quat = init_quat
+
+        # For heterogeneous simulation: which environments this vgeom is active in (None = all envs)
+        self.active_envs_mask: torch.Tensor | None = None
+        self.active_envs_idx: np.ndarray | None = None
 
         self._init_vverts = vmesh.verts
         self._init_vfaces = vmesh.faces
@@ -872,26 +878,41 @@ class RigidVisGeom(RBC):
     # ------------------------------------------------------------------------------------
 
     @gs.assert_built
-    def get_pos(self):
+    def get_pos(self, envs_idx=None):
         """
         Get the position of the geom in world frame.
         """
-        tensor = torch.empty(self._solver._batch_shape(3, True), dtype=gs.tc_float, device=gs.device)
-        _kernel_get_vgeoms_pos(tensor, self._idx, self._solver.vgeoms_state)
-        if self._solver.n_envs == 0:
-            tensor = tensor.squeeze(0)
-        return tensor
+        tensor = ti_to_torch(self._solver.vgeoms_state.pos, envs_idx, self._idx, transpose=True, copy=True)[..., 0, :]
+        return tensor[0] if self._solver.n_envs == 0 else tensor
 
     @gs.assert_built
-    def get_quat(self):
+    def get_quat(self, envs_idx=None):
         """
         Get the quaternion of the geom in world frame.
         """
-        tensor = torch.empty(self._solver._batch_shape(4, True), dtype=gs.tc_float, device=gs.device)
-        _kernel_get_vgeoms_quat(tensor, self._idx, self._solver.vgeoms_state)
-        if self._solver.n_envs == 0:
-            tensor = tensor.squeeze(0)
-        return tensor
+        tensor = ti_to_torch(self._solver.vgeoms_state.quat, envs_idx, self._idx, transpose=True, copy=True)[..., 0, :]
+        return tensor[0] if self._solver.n_envs == 0 else tensor
+
+    @gs.assert_built
+    def get_vAABB(self, envs_idx=None):
+        """
+        Get the axis-aligned bounding box (AABB) of the geom in world frame.
+
+        This method computes the bounding box of the geometry after aggressive decimation of its convex hull. This is
+        usually sufficiently accurate (<1mm), while significantly improving runtime speed and reducing memory footprint.
+        """
+        if self._aabb_verts is None:
+            # Aggressiveness has been tuned to give sub-millimeter accuracy on Franka robot in random configurations
+            aabb_mesh = self.vmesh.copy()
+            aabb_mesh.convexify()
+            aabb_mesh.decimate(decimate_face_num=NUM_VERTS_VISUAL_GEOM_AABB, decimate_aggressiveness=3, convexify=False)
+            self._aabb_verts = torch.from_numpy(aabb_mesh.verts).to(dtype=gs.tc_float, device=gs.device)
+
+        pos, quat = gu.transform_pos_quat_by_trans_quat(
+            self._init_pos_tc, self._init_quat_tc, self.link.get_pos(envs_idx), self.link.get_quat(envs_idx)
+        )
+        vverts_pos = pos[..., None, :] + gu.transform_by_quat(self._aabb_verts, quat[..., None, :])
+        return torch.stack((vverts_pos.min(dim=-2).values, vverts_pos.max(dim=-2).values), dim=-2)
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------
@@ -1043,10 +1064,14 @@ class RigidVisGeom(RBC):
 
     @property
     def is_free(self):
+        raise DeprecationError("This property has been removed.")
+
+    @property
+    def is_fixed(self) -> bool:
         """
-        Whether the rigid entity the vgeom belongs to is free.
+        Whether this vgeom is fixed in the world.
         """
-        return self.entity.is_free
+        return self.link.is_fixed
 
     # ------------------------------------------------------------------------------------
     # -------------------------------------- repr ----------------------------------------
@@ -1054,53 +1079,3 @@ class RigidVisGeom(RBC):
 
     def _repr_brief(self):
         return f"{self._repr_type()}: {self._uid}, idx: {self._idx} (from entity {self._entity.uid}, link {self._link.uid})"
-
-
-@ti.kernel
-def _kernel_get_geoms_pos(tensor: ti.types.ndarray(), geom_idx: ti.i32, geoms_state: array_class.GeomsState):
-    _B = geoms_state.pos.shape[1]
-    for i, i_b in ti.ndrange(3, _B):
-        tensor[i_b, i] = geoms_state.pos[geom_idx, i_b][i]
-
-
-@ti.kernel
-def _kernel_get_geoms_quat(tensor: ti.types.ndarray(), geom_idx: ti.i32, geoms_state: array_class.GeomsState):
-    _B = geoms_state.pos.shape[1]
-    for i, i_b in ti.ndrange(4, _B):
-        tensor[i_b, i] = geoms_state.quat[geom_idx, i_b][i]
-
-
-@ti.kernel
-def _kernel_get_vgeoms_pos(tensor: ti.types.ndarray(), vgeom_idx: ti.i32, vgeoms_state: array_class.VGeomsState):
-    _B = vgeoms_state.pos.shape[1]
-    for i, i_b in ti.ndrange(3, _B):
-        tensor[i_b, i] = vgeoms_state.pos[vgeom_idx, i_b][i]
-
-
-@ti.kernel
-def _kernel_get_vgeoms_quat(tensor: ti.types.ndarray(), vgeom_idx: ti.i32, vgeoms_state: array_class.VGeomsState):
-    _B = vgeoms_state.pos.shape[1]
-    for i, i_b in ti.ndrange(4, _B):
-        tensor[i_b, i] = vgeoms_state.quat[vgeom_idx, i_b][i]
-
-
-@ti.kernel
-def _kernel_get_free_verts(
-    tensor: ti.types.ndarray(), verts_state_start: ti.i32, n_verts: ti.i32, free_verts_state: array_class.FreeVertsState
-):
-    _B = free_verts_state.pos.shape[1]
-    for i_v, j, i_b in ti.ndrange(n_verts, 3, _B):
-        idx_vert = i_v + verts_state_start
-        tensor[i_b, i_v, j] = free_verts_state.pos[idx_vert, i_b][j]
-
-
-@ti.kernel
-def _kernel_get_fixed_verts(
-    tensor: ti.types.ndarray(),
-    verts_state_start: ti.i32,
-    n_verts: ti.i32,
-    fixed_verts_state: array_class.FixedVertsState,
-):
-    for i_v, j in ti.ndrange(n_verts, 3):
-        idx_vert = i_v + verts_state_start
-        tensor[i_v, j] = fixed_verts_state.pos[idx_vert][j]

@@ -12,7 +12,9 @@ from genesis.engine.entities import (
     PBDFreeParticleEntity,
     PBDParticleEntity,
 )
+from genesis.engine.entities.pbd_entity import PBDTetEntity
 from genesis.engine.states.solvers import PBDSolverState
+from genesis.utils.array_class import LinksState
 from genesis.utils.geom import SpatialHasher
 
 from .base_solver import Solver
@@ -24,11 +26,11 @@ class PBDSolver(Solver):
     # --------------------------------- Initialization -----------------------------------
     # ------------------------------------------------------------------------------------
 
-    class MATS(gs.IntEnum):
+    class MATERIAL(gs.IntEnum):
         CLOTH = 0
         ELASTIC = 1
         LIQUID = 2
-        PARTICLE = 3  # non-physcis particles
+        PARTICLE = 3  # non-physics particles
 
     def __init__(self, scene, sim, options):
         super().__init__(scene, sim, options)
@@ -79,17 +81,6 @@ class PBDSolver(Solver):
         # boundary
         self.setup_boundary()
 
-    def _batch_shape(self, shape=None, first_dim=False, B=None):
-        if B is None:
-            B = self._B
-
-        if shape is None:
-            return (B,)
-        elif isinstance(shape, (list, tuple)):
-            return (B,) + shape if first_dim else shape + (B,)
-        else:
-            return (B, shape) if first_dim else (shape, B)
-
     def setup_boundary(self):
         self.boundary = CubeBoundary(
             lower=self._lower_bound,
@@ -101,14 +92,14 @@ class PBDSolver(Solver):
             support_idxs=ti.types.vector(self._n_vvert_supports, gs.ti_int),
             support_weights=ti.types.vector(self._n_vvert_supports, gs.ti_float),
         )
-        self.vverts_info = struct_vvert_info.field(shape=max(1, self._n_vverts), layout=ti.Layout.SOA)
+        self.vverts_info = struct_vvert_info.field(shape=(max(self._n_vverts, 1),), layout=ti.Layout.SOA)
 
         struct_vvert_state_render = ti.types.struct(
             pos=gs.ti_vec3,
             active=gs.ti_bool,
         )
         self.vverts_render = struct_vvert_state_render.field(
-            shape=self._batch_shape(shape=max(1, self._n_vverts)), layout=ti.Layout.SOA
+            shape=(max(self._n_vverts, 1), self._B), layout=ti.Layout.SOA
         )
 
     def init_particle_fields(self):
@@ -117,7 +108,7 @@ class PBDSolver(Solver):
             mass=gs.ti_float,
             pos_rest=gs.ti_vec3,
             rho_rest=gs.ti_float,
-            mat_type=gs.ti_int,
+            material_type=gs.ti_int,
             mu_s=gs.ti_float,
             mu_k=gs.ti_float,
             air_resistance=gs.ti_float,
@@ -148,25 +139,18 @@ class PBDSolver(Solver):
             active=gs.ti_bool,
         )
 
-        self.particles_info = struct_particle_info.field(shape=self._n_particles, layout=ti.Layout.SOA)
+        self.particles_info = struct_particle_info.field(shape=(self._n_particles,), layout=ti.Layout.SOA)
         self.particles_info_reordered = struct_particle_info.field(
-            shape=self._batch_shape(self._n_particles), layout=ti.Layout.SOA
+            shape=(self._n_particles, self._B), layout=ti.Layout.SOA
         )
-
-        self.particles = struct_particle_state.field(shape=self._batch_shape(self._n_particles), layout=ti.Layout.SOA)
-        self.particles_reordered = struct_particle_state.field(
-            shape=self._batch_shape(self._n_particles), layout=ti.Layout.SOA
-        )
-
-        self.particles_ng = struct_particle_state_ng.field(
-            shape=self._batch_shape(self._n_particles), layout=ti.Layout.SOA
-        )
+        self.particles = struct_particle_state.field(shape=(self._n_particles, self._B), layout=ti.Layout.SOA)
+        self.particles_reordered = struct_particle_state.field(shape=(self._n_particles, self._B), layout=ti.Layout.SOA)
+        self.particles_ng = struct_particle_state_ng.field(shape=(self._n_particles, self._B), layout=ti.Layout.SOA)
         self.particles_ng_reordered = struct_particle_state_ng.field(
-            shape=self._batch_shape(self._n_particles), layout=ti.Layout.SOA
+            shape=(self._n_particles, self._B), layout=ti.Layout.SOA
         )
-
         self.particles_render = struct_particle_state_render.field(
-            shape=self._batch_shape(self._n_particles), layout=ti.Layout.SOA
+            shape=(self._n_particles, self._B), layout=ti.Layout.SOA
         )
 
     def init_edge_fields(self):
@@ -178,7 +162,7 @@ class PBDSolver(Solver):
             v1=gs.ti_int,
             v2=gs.ti_int,
         )
-        self.edges_info = struct_edge_info.field(shape=max(1, self._n_edges), layout=ti.Layout.SOA)
+        self.edges_info = struct_edge_info.field(shape=(max(1, self._n_edges),), layout=ti.Layout.SOA)
 
         # inner edges information for bending. edge: (v1, v2), adjacent faces: (v1, v2, v3) and (v1, v2, v4)
         struct_inner_edge_info = ti.types.struct(
@@ -190,7 +174,7 @@ class PBDSolver(Solver):
             v3=gs.ti_int,
             v4=gs.ti_int,
         )
-        self.inner_edges_info = struct_inner_edge_info.field(shape=max(1, self._n_inner_edges), layout=ti.Layout.SOA)
+        self.inner_edges_info = struct_inner_edge_info.field(shape=(max(self._n_inner_edges, 1),), layout=ti.Layout.SOA)
 
     def init_elem_fields(self):
         struct_elem_info = ti.types.struct(
@@ -202,13 +186,17 @@ class PBDSolver(Solver):
             v3=gs.ti_int,
             v4=gs.ti_int,
         )
-        self.elems_info = struct_elem_info.field(shape=max(1, self._n_elems), layout=ti.Layout.SOA)
+        self.elems_info = struct_elem_info.field(shape=(max(self._n_elems, 1),), layout=ti.Layout.SOA)
 
     def init_ckpt(self):
         self._ckpt = dict()
 
+    def reset_grad(self):
+        pass
+
     def build(self):
         super().build()
+
         self._B = self._sim._B
         self._n_particles = self.n_particles
         self._n_fluid_particles = self.n_fluid_particles
@@ -218,7 +206,7 @@ class PBDSolver(Solver):
         self._n_vverts = self.n_vverts
         self._n_vfaces = self.n_vfaces
 
-        if self.is_active():
+        if self.is_active:
             self.sh.build(self._B)
 
             self.init_particle_fields()
@@ -231,9 +219,19 @@ class PBDSolver(Solver):
             for entity in self._entities:
                 entity._add_to_solver()
 
+        # Overwrite gravity because only field is supported for now
+        if self._gravity is not None:
+            gravity = self._gravity.to_numpy()
+            self._gravity = ti.field(dtype=gs.ti_vec3, shape=(self._B,))
+            self._gravity.from_numpy(gravity)
+
     # ------------------------------------------------------------------------------------
     # -------------------------------------- misc ----------------------------------------
     # ------------------------------------------------------------------------------------
+
+    @property
+    def is_active(self):
+        return self.n_particles > 0
 
     def add_entity(self, idx, material, morph, surface):
         if isinstance(material, gs.materials.PBD.Cloth):
@@ -299,9 +297,6 @@ class PBDSolver(Solver):
 
         return entity
 
-    def is_active(self):
-        return self._n_particles > 0
-
     # ------------------------------------------------------------------------------------
     # ------------------------------------- utils ----------------------------------------
     # ------------------------------------------------------------------------------------
@@ -309,7 +304,7 @@ class PBDSolver(Solver):
     @ti.func
     def poly6(self, dist):
         # dist is a VECTOR
-        result = 0.0
+        result = gs.ti_float(0.0)
         d = dist.norm() / self.dist_scale
         if 0 < d < self.h:
             rhs = (self.h_2 - d * d) * (self.h_2 - d * d) * (self.h_2 - d * d)
@@ -319,7 +314,7 @@ class PBDSolver(Solver):
     @ti.func
     def poly6_scalar(self, dist):
         # dist is a SCALAR
-        result = 0.0
+        result = gs.ti_float(0.0)
         d = dist
         if 0 < d < self.h:
             rhs = (self.h_2 - d * d) * (self.h_2 - d * d) * (self.h_2 - d * d)
@@ -380,7 +375,7 @@ class PBDSolver(Solver):
                     acc += self._ffs[i_ff].get_acc(self.particles[i_p, i_b].pos, self.particles[i_p, i_b].vel, t, i_p)
                 self.particles[i_p, i_b].vel = self.particles[i_p, i_b].vel + acc * self._substep_dt
 
-                if self.particles_info[i_p].mat_type == self.MATS.CLOTH:
+                if self.particles_info[i_p].material_type == self.MATERIAL.CLOTH:
                     f_air_resistance = (
                         self.particles_info[i_p].air_resistance
                         * self.particles[i_p, i_b].vel.norm()
@@ -390,6 +385,8 @@ class PBDSolver(Solver):
                         self.particles[i_p, i_b].vel
                         - f_air_resistance / self.particles_info[i_p].mass * self._substep_dt
                     )
+
+            # attached particles are not free but still need to update position to follow the link
             self.particles[i_p, i_b].pos = (
                 self.particles[i_p, i_b].pos + self.particles[i_p, i_b].vel * self._substep_dt
             )
@@ -411,29 +408,9 @@ class PBDSolver(Solver):
                 self.particles[v2, i_b].dpos -= dp * w2
 
             for i_p, i_b in ti.ndrange(self._n_particles, self._B):
-                if self.particles[i_p, i_b].free and self.particles_info[i_p].mat_type != self.MATS.PARTICLE:
+                if self.particles[i_p, i_b].free and self.particles_info[i_p].material_type != self.MATERIAL.PARTICLE:
                     self.particles[i_p, i_b].pos = self.particles[i_p, i_b].pos + self.particles[i_p, i_b].dpos
                     self.particles[i_p, i_b].dpos.fill(0)
-
-    # @ti.kernel
-    # def _kernel_solve_bending(self, f: ti.i32):
-    #     for i_ie in range(self._n_inner_edges):
-    #         v1 = self.inner_edges_info[i_ie].v3
-    #         v2 = self.inner_edges_info[i_ie].v4
-
-    #         w1 = 1.0 / self.particles_info[v1].mass * self.particles[v1].free
-    #         w2 = 1.0 / self.particles_info[v2].mass * self.particles[v2].free
-    #         n = self.particles[v1].pos - self.particles[v2].pos
-    #         C = n.norm() - self.inner_edges_info[i_ie].len_rest
-    #         alpha = self.inner_edges_info[i_ie].bending_compliance / (self._substep_dt ** 2)
-    #         dp = -C / (w1 + w2 + alpha) * n / n.norm(gs.EPS) * self.inner_edges_info[i_ie].bending_relaxation
-    #         self.particles[v1].dpos += dp * w1
-    #         self.particles[v2].dpos -= dp * w2
-
-    #     for i in range(self._n_particles):
-    #         if self.particles[i].free:
-    #             self.particles[i].pos = self.particles[i].pos + self.particles[i].dpos
-    #             self.particles[i].dpos.fill(0)
 
     @ti.kernel
     def _kernel_solve_bending(self, f: ti.i32):
@@ -484,7 +461,7 @@ class PBDSolver(Solver):
                     self.particles[v4, i_b].dpos += w4 * constraint * q4
 
             for i_p, i_b in ti.ndrange(self._n_particles, self._B):
-                if self.particles[i_p, i_b].free and self.particles_info[i_p].mat_type != self.MATS.PARTICLE:
+                if self.particles[i_p, i_b].free and self.particles_info[i_p].material_type != self.MATERIAL.PARTICLE:
                     self.particles[i_p, i_b].pos = self.particles[i_p, i_b].pos + self.particles[i_p, i_b].dpos
                     self.particles[i_p, i_b].dpos.fill(0)
 
@@ -524,7 +501,7 @@ class PBDSolver(Solver):
                     self.particles[v4, i_b].dpos += s * w4 * grad4
 
             for i_p, i_b in ti.ndrange(self._n_particles, self._B):
-                if self.particles[i_p, i_b].free and self.particles_info[i_p].mat_type != self.MATS.PARTICLE:
+                if self.particles[i_p, i_b].free and self.particles_info[i_p].material_type != self.MATERIAL.PARTICLE:
                     self.particles[i_p, i_b].pos = self.particles[i_p, i_b].pos + self.particles[i_p, i_b].dpos
                     self.particles[i_p, i_b].dpos.fill(0)
 
@@ -566,7 +543,7 @@ class PBDSolver(Solver):
     @ti.kernel
     def _kernel_solve_collision(self, f: ti.i32):
         for i_p, i_b in ti.ndrange(self._n_particles, self._B):
-            if self.particles_info_reordered[i_p, i_b].mat_type != self.MATS.PARTICLE:
+            if self.particles_info_reordered[i_p, i_b].material_type != self.MATERIAL.PARTICLE:
                 base = self.sh.pos_to_grid(self.particles_reordered[i_p, i_b].pos)
                 for offset in ti.grouped(ti.ndrange((-1, 2), (-1, 2), (-1, 2))):
                     slot_idx = self.sh.grid_to_slot(base + offset)
@@ -574,16 +551,20 @@ class PBDSolver(Solver):
                         self.sh.slot_start[slot_idx, i_b],
                         self.sh.slot_size[slot_idx, i_b] + self.sh.slot_start[slot_idx, i_b],
                     ):
-                        if i_p != j and not (
-                            self.particles_info_reordered[i_p, i_b].mat_type == self.MATS.LIQUID
-                            and self.particles_info_reordered[j, i_b].mat_type == self.MATS.LIQUID
+                        if (
+                            i_p != j
+                            and (self.particles_reordered[i_p, i_b].free or self.particles_reordered[j, i_b].free)
+                            and not (
+                                self.particles_info_reordered[i_p, i_b].material_type == self.MATERIAL.LIQUID
+                                and self.particles_info_reordered[j, i_b].material_type == self.MATERIAL.LIQUID
+                            )
                         ):
                             self._func_solve_collision(i_p, j, i_b)
 
         for i_p, i_b in ti.ndrange(self._n_particles, self._B):
             if (
                 self.particles_reordered[i_p, i_b].free
-                and self.particles_info_reordered[i_p, i_b].mat_type != self.MATS.PARTICLE
+                and self.particles_info_reordered[i_p, i_b].material_type != self.MATERIAL.PARTICLE
             ):
                 self.particles_reordered[i_p, i_b].pos = (
                     self.particles_reordered[i_p, i_b].pos + self.particles_reordered[i_p, i_b].dpos
@@ -603,11 +584,11 @@ class PBDSolver(Solver):
         for _ in ti.static(range(self._max_density_solver_iterations)):
             # ---Calculate lambdas---
             for i_p, i_b in ti.ndrange(self._n_particles, self._B):
-                if self.particles_info_reordered[i_p, i_b].mat_type == self.MATS.LIQUID:
+                if self.particles_info_reordered[i_p, i_b].material_type == self.MATERIAL.LIQUID:
                     pos_i = self.particles_reordered[i_p, i_b].pos
                     base = self.sh.pos_to_grid(pos_i)
-                    lower_sum = 0.0
-                    rho = 0.0
+                    lower_sum = gs.ti_float(0.0)
+                    rho = gs.ti_float(0.0)
                     spiky_i = ti.Vector.zero(gs.ti_float, 3)
                     for offset in ti.grouped(ti.ndrange((-1, 2), (-1, 2), (-1, 2))):
                         slot_idx = self.sh.grid_to_slot(base + offset)
@@ -628,7 +609,7 @@ class PBDSolver(Solver):
 
             # ---Calculate delta pos---
             for i_p, i_b in ti.ndrange(self._n_particles, self._B):
-                if self.particles_info_reordered[i_p, i_b].mat_type == self.MATS.LIQUID:
+                if self.particles_info_reordered[i_p, i_b].material_type == self.MATERIAL.LIQUID:
                     pos_i = self.particles_reordered[i_p, i_b].pos
                     base = self.sh.pos_to_grid(pos_i)
                     for offset in ti.grouped(ti.ndrange((-1, 2), (-1, 2), (-1, 2))):
@@ -658,7 +639,7 @@ class PBDSolver(Solver):
 
             for i_p, i_b in ti.ndrange(self._n_particles, self._B):
                 if (
-                    self.particles_info_reordered[i_p, i_b].mat_type == self.MATS.LIQUID
+                    self.particles_info_reordered[i_p, i_b].material_type == self.MATERIAL.LIQUID
                     and self.particles_reordered[i_p, i_b].free
                 ):
                     self.particles_reordered[i_p, i_b].pos = (
@@ -670,7 +651,7 @@ class PBDSolver(Solver):
     def _kernel_solve_viscosity(self, f: ti.i32):
         for _ in ti.static(range(self._max_viscosity_solver_iterations)):
             for i_p, i_b in ti.ndrange(self._n_particles, self._B):
-                if self.particles_info_reordered[i_p, i_b].mat_type == self.MATS.LIQUID:
+                if self.particles_info_reordered[i_p, i_b].material_type == self.MATERIAL.LIQUID:
                     pos_i = self.particles_reordered[i_p, i_b].pos
                     base = self.sh.pos_to_grid(pos_i)
                     xsph_sum = ti.Vector.zero(gs.ti_float, 3)
@@ -692,7 +673,6 @@ class PBDSolver(Solver):
                             self.sh.slot_start[slot_idx, i_b],
                             self.sh.slot_size[slot_idx, i_b] + self.sh.slot_start[slot_idx, i_b],
                         ):
-
                             pos_j = self.particles_reordered[j, i_b].pos
                             v_ij = (self.particles_reordered[j, i_b].pos - self.particles_reordered[j, i_b].ipos) - (
                                 self.particles_reordered[i_p, i_b].pos - self.particles_reordered[i_p, i_b].ipos
@@ -729,7 +709,7 @@ class PBDSolver(Solver):
 
             for i_p, i_b in ti.ndrange(self._n_particles, self._B):
                 if (
-                    self.particles_info_reordered[i_p, i_b].mat_type == self.MATS.LIQUID
+                    self.particles_info_reordered[i_p, i_b].material_type == self.MATERIAL.LIQUID
                     and self.particles_reordered[i_p, i_b].free
                 ):
                     self.particles_reordered[i_p, i_b].pos = (
@@ -763,7 +743,7 @@ class PBDSolver(Solver):
         pass
 
     def substep_pre_coupling(self, f):
-        if self.is_active():
+        if self.is_active:
             self._kernel_store_initial_pos(f)
             self._kernel_apply_external_force(f, self._sim.cur_t)
 
@@ -794,7 +774,7 @@ class PBDSolver(Solver):
         pass
 
     def substep_post_coupling(self, f):
-        if self.is_active():
+        if self.is_active:
             self._kernel_copy_from_reordered(f)
 
             # boundary collision
@@ -803,21 +783,19 @@ class PBDSolver(Solver):
     def substep_post_coupling_grad(self, f):
         pass
 
-    def reset_grad(self):
-        pass
-
     # ------------------------------------------------------------------------------------
     # ------------------------------------ gradient --------------------------------------
     # ------------------------------------------------------------------------------------
 
     def collect_output_grads(self):
-        """
-        Collect gradients from downstream queried states.
-        """
         pass
 
     def add_grad_from_state(self, state):
         pass
+
+    # ------------------------------------------------------------------------------------
+    # --------------------------------------- io -----------------------------------------
+    # ------------------------------------------------------------------------------------
 
     def save_ckpt(self, ckpt_name):
         pass
@@ -825,65 +803,12 @@ class PBDSolver(Solver):
     def load_ckpt(self, ckpt_name):
         pass
 
-    # ------------------------------------------------------------------------------------
-    # --------------------------------------- io -----------------------------------------
-    # ------------------------------------------------------------------------------------
+    def set_state(self, f, state, envs_idx=None):
+        if self.is_active:
+            self._kernel_set_state(f, state.pos, state.vel, state.free)
 
     @ti.kernel
-    def _kernel_set_particles_pos(
-        self,
-        f: ti.i32,
-        particle_start: ti.i32,
-        n_particles: ti.i32,
-        pos: ti.types.ndarray(),  # shape [B, n_particles, 3]
-    ):
-        for i_p, i_b in ti.ndrange(n_particles, self._B):
-            i_global = i_p + particle_start
-            for k in ti.static(range(3)):
-                self.particles[i_global, i_b].pos[k] = pos[i_b, i_p, k]
-            self.particles[i_global, i_b].vel.fill(0.0)
-
-    @ti.kernel
-    def _kernel_set_particles_vel(
-        self,
-        f: ti.i32,
-        particle_start: ti.i32,
-        n_particles: ti.i32,
-        vel: ti.types.ndarray(),  # shape [B, n_particles, 3]
-    ):
-        for i_p, i_b in ti.ndrange(n_particles, self._B):
-            i_global = i_p + particle_start
-            for k in ti.static(range(3)):
-                self.particles[i_global, i_b].vel[k] = vel[i_b, i_p, k]
-
-    @ti.kernel
-    def _kernel_set_particles_active(
-        self,
-        f: ti.i32,
-        particle_start: ti.i32,
-        n_particles: ti.i32,
-        active: ti.i32,
-    ):
-        for i_p, i_b in ti.ndrange(n_particles, self._B):
-            i_global = i_p + particle_start
-            self.particles_ng[i_global, i_b].active = active
-
-    @ti.kernel
-    def _kernel_get_frame(
-        self,
-        f: ti.i32,
-        pos: ti.types.ndarray(),  # shape [B, _n_particles, 3]
-        vel: ti.types.ndarray(),  # shape [B, _n_particles, 3]
-        free: ti.types.ndarray(),  # shape [B, _n_particles]
-    ):
-        for i_p, i_b in ti.ndrange(self._n_particles, self._B):
-            for j in ti.static(range(3)):
-                pos[i_b, i_p, j] = self.particles[i_p, i_b].pos[j]
-                vel[i_b, i_p, j] = self.particles[i_p, i_b].vel[j]
-            free[i_b, i_p] = ti.cast(self.particles[i_p, i_b].free, gs.ti_bool)
-
-    @ti.kernel
-    def _kernel_set_frame(
+    def _kernel_set_state(
         self,
         f: ti.i32,
         pos: ti.types.ndarray(),  # shape [B, _n_particles, 3]
@@ -897,16 +822,29 @@ class PBDSolver(Solver):
             self.particles[i_p, i_b].free = free[i_b, i_p]
 
     def get_state(self, f):
-        if self.is_active():
+        if self.is_active:
             state = PBDSolverState(self.scene)
-            self._kernel_get_frame(f, state.pos, state.vel, state.free)
+            self._kernel_get_state(f, state.pos, state.vel, state.free)
         else:
             state = None
         return state
 
-    def set_state(self, f, state, envs_idx=None):
-        if self.is_active():
-            self._kernel_set_frame(f, state.pos, state.vel, state.free)
+    @ti.kernel
+    def _kernel_get_state(
+        self,
+        f: ti.i32,
+        pos: ti.types.ndarray(),  # shape [B, _n_particles, 3]
+        vel: ti.types.ndarray(),  # shape [B, _n_particles, 3]
+        free: ti.types.ndarray(),  # shape [B, _n_particles]
+    ):
+        for i_p, i_b in ti.ndrange(self._n_particles, self._B):
+            for j in ti.static(range(3)):
+                pos[i_b, i_p, j] = self.particles[i_p, i_b].pos[j]
+                vel[i_b, i_p, j] = self.particles[i_p, i_b].vel[j]
+            free[i_b, i_p] = ti.cast(self.particles[i_p, i_b].free, gs.ti_bool)
+
+    def update_render_fields(self):
+        self._kernel_update_render_fields(self.sim.cur_substep_local)
 
     @ti.kernel
     def _kernel_update_render_fields(self, f: ti.i32):
@@ -930,98 +868,167 @@ class PBDSolver(Solver):
                 self.vverts_info.support_idxs[i_v][0], i_b
             ].active
 
-    def update_render_fields(self):
-        self._kernel_update_render_fields(self.sim.cur_substep_local)
-
-    @gs.assert_built
-    def fix_particle(self, particle_idx, i_b):
-        self._kernel_fix_particle(particle_idx, i_b)
+    @ti.kernel
+    def _kernel_set_particles_pos(
+        self,
+        particles_idx: ti.types.ndarray(),
+        envs_idx: ti.types.ndarray(),
+        poss: ti.types.ndarray(),
+    ):
+        for i_p_, i_b_ in ti.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
+            i_p = particles_idx[i_b_, i_p_]
+            i_b = envs_idx[i_b_]
+            for i in ti.static(range(3)):
+                self.particles[i_p, i_b].pos[i] = poss[i_b_, i_p_, i]
+            self.particles[i_p, i_b].vel.fill(0.0)
 
     @ti.kernel
-    def _kernel_fix_particle(self, particle_idx: ti.i32, i_b: ti.i32):
-        self.particles[particle_idx, i_b].free = 0
-
-    @gs.assert_built
-    def set_particle_position(self, particle_idx, pos, i_b):
-        self._kernel_set_particle_position(particle_idx, pos, i_b)
-
-    @ti.kernel
-    def _kernel_set_particle_position(self, particle_idx: ti.i32, pos: ti.types.ndarray(), i_b: ti.i32):
-        for i in range(3):
-            self.particles[particle_idx, i_b].pos[i] = pos[i]
-        self.particles[particle_idx, i_b].free = 0
-
-    @gs.assert_built
-    def set_particle_velocity(self, particle_idx, vel, i_b):
-        self._kernel_set_particle_velocity(particle_idx, vel, i_b)
+    def _kernel_get_particles_pos(
+        self,
+        particle_start: ti.i32,
+        n_particles: ti.i32,
+        envs_idx: ti.types.ndarray(),
+        poss: ti.types.ndarray(),
+    ):
+        for i_p_, i_b_ in ti.ndrange(n_particles, envs_idx.shape[0]):
+            i_p = i_p_ + particle_start
+            i_b = envs_idx[i_b_]
+            for i in ti.static(range(3)):
+                poss[i_b_, i_p_, i] = self.particles[i_p, i_b].pos[i]
 
     @ti.kernel
-    def _kernel_set_particle_velocity(self, particle_idx: ti.i32, vel: ti.types.ndarray(), i_b: ti.i32):
-        for i in range(3):
-            self.particles[particle_idx, i_b].vel[i] = vel[i]
-        self.particles[particle_idx, i_b].free = 0
+    def _kernel_set_particles_vel(
+        self,
+        particles_idx: ti.types.ndarray(),
+        envs_idx: ti.types.ndarray(),
+        vels: ti.types.ndarray(),
+    ):
+        for i_p_, i_b_ in ti.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
+            i_p = particles_idx[i_b_, i_p_]
+            i_b = envs_idx[i_b_]
+            for i in ti.static(range(3)):
+                self.particles[i_p, i_b].vel[i] = vels[i_b_, i_p_, i]
 
     @gs.assert_built
-    def release_particle(self, particle_idx, i_b):
-        self._kernel_release_particle(particle_idx, i_b)
+    def set_animate_particles_by_link(
+        self,
+        particles_idx,
+        link_idx: int,
+        links_state: LinksState,
+        envs_idx=None,
+    ) -> None:
+        envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+        self._sim._coupler.kernel_attach_pbd_to_rigid_link(particles_idx, envs_idx, link_idx, links_state)
 
     @ti.kernel
-    def _kernel_release_particle(self, particle_idx: ti.i32, i_b: ti.i32):
-        self.particles[particle_idx, i_b].free = 1
+    def _kernel_get_particles_vel(
+        self,
+        particle_start: ti.i32,
+        n_particles: ti.i32,
+        envs_idx: ti.types.ndarray(),
+        vels: ti.types.ndarray(),
+    ):
+        for i_p_, i_b_ in ti.ndrange(n_particles, envs_idx.shape[0]):
+            i_p = i_p_ + particle_start
+            i_b = envs_idx[i_b_]
+            for i in ti.static(range(3)):
+                vels[i_b_, i_p_, i] = self.particles[i_p, i_b].vel[i]
+
+    @ti.kernel
+    def _kernel_set_particles_active(
+        self,
+        particles_idx: ti.types.ndarray(),
+        envs_idx: ti.types.ndarray(),
+        actives: ti.types.ndarray(),  # shape [B, n_particles]
+    ):
+        for i_p_, i_b_ in ti.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
+            i_p = particles_idx[i_b_, i_p_]
+            i_b = envs_idx[i_b_]
+            self.particles_ng[i_p, i_b].active = ti.cast(actives[i_b_, i_p_], gs.ti_bool)
+
+    @ti.kernel
+    def _kernel_get_particles_active(
+        self,
+        particle_start: ti.i32,
+        n_particles: ti.i32,
+        envs_idx: ti.types.ndarray(),
+        actives: ti.types.ndarray(),  # shape [B, n_particles]
+    ):
+        for i_p_, i_b_ in ti.ndrange(n_particles, envs_idx.shape[0]):
+            i_p = i_p_ + particle_start
+            i_b = envs_idx[i_b_]
+            actives[i_b_, i_p_] = self.particles_ng[i_p, i_b].active
+
+    @ti.kernel
+    def _kernel_fix_particles(self, particles_idx: ti.types.ndarray(), envs_idx: ti.types.ndarray()):
+        for i_p_, i_b_ in ti.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
+            i_p = particles_idx[i_b_, i_p_]
+            i_b = envs_idx[i_b_]
+            self.particles[i_p, i_b].free = False
+
+    @ti.kernel
+    def _kernel_release_particle(self, particles_idx: ti.types.ndarray(), envs_idx: ti.types.ndarray()):
+        for i_p_, i_b_ in ti.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
+            i_p = particles_idx[i_b_, i_p_]
+            i_b = envs_idx[i_b_]
+            self.particles[i_p, i_b].free = True
+
+    @ti.kernel
+    def _kernel_get_mass(
+        self, particle_start: ti.i32, n_particles: ti.i32, mass: ti.types.ndarray(), envs_idx: ti.types.ndarray()
+    ):
+        total_mass = gs.ti_float(0.0)
+        for i_p_ in range(n_particles):
+            i_p = i_p_ + particle_start
+            total_mass += self.particles_info[i_p].mass
+        for i_b_ in range(envs_idx.shape[0]):
+            mass[i_b_] = total_mass
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------
     # ------------------------------------------------------------------------------------
+
     @property
     def n_particles(self):
         if self.is_built:
             return self._n_particles
-        else:
-            return sum([entity.n_particles for entity in self._entities])
+        return sum([entity.n_particles for entity in self._entities])
 
     @property
     def n_fluid_particles(self):
         if self.is_built:
             return self._n_fluid_particles
-        else:
-            return sum(
-                [entity.n_fluid_particles if hasattr(entity, "n_fluid_particles") else 0 for entity in self._entities]
-            )
+        return sum(entity.n_fluid_particles for entity in self._entities if isinstance(entity, PBDParticleEntity))
 
     @property
     def n_edges(self):
         if self.is_built:
             return self._n_edges
-        else:
-            return sum([entity.n_edges if hasattr(entity, "n_edges") else 0 for entity in self._entities])
+        return sum(entity.n_edges for entity in self._entities if isinstance(entity, PBDTetEntity))
 
     @property
     def n_inner_edges(self):
         if self.is_built:
             return self._n_inner_edges
-        else:
-            return sum([entity.n_inner_edges if hasattr(entity, "n_inner_edges") else 0 for entity in self._entities])
+        return sum(entity.n_inner_edges for entity in self._entities if isinstance(entity, PBD2DEntity))
 
     @property
     def n_elems(self):
         if self.is_built:
             return self._n_elems
-        else:
-            return sum([entity.n_elems if hasattr(entity, "n_elems") else 0 for entity in self._entities])
+        return sum(entity.n_elems for entity in self._entities if isinstance(entity, PBD3DEntity))
 
     @property
     def n_vverts(self):
         if self.is_built:
             return self._n_vverts
-        else:
-            return sum([entity.n_vverts if hasattr(entity, "n_vverts") else 0 for entity in self._entities])
+        return sum(entity.n_vverts for entity in self._entities)
 
     @property
     def n_vfaces(self):
         if self.is_built:
             return self._n_vfaces
-        else:
-            return sum([entity.n_vfaces if hasattr(entity, "n_vfaces") else 0 for entity in self._entities])
+        return sum(entity.n_vfaces for entity in self._entities)
 
     @property
     def particle_size(self):

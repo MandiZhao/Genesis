@@ -5,10 +5,11 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-
 import numpy as np
-from scipy import interpolate
+
 import genesis as gs
+import genesis.utils.geom as gu
+
 
 def fractal_terrain(terrain, levels=8, scale=1.0):
     """
@@ -16,7 +17,7 @@ def fractal_terrain(terrain, levels=8, scale=1.0):
 
     Parameters
         terrain (SubTerrain): the terrain
-        levels (int, optional): granurarity of the fractal terrain. Defaults to 8.
+        levels (int, optional): granularity of the fractal terrain. Defaults to 8.
         scale (float, optional): scales vertical variation. Defaults to 1.0.
     """
     width = terrain.width
@@ -59,6 +60,8 @@ def random_uniform_terrain(
     """
     if downsampled_scale is None:
         downsampled_scale = terrain.horizontal_scale
+    scaled_width = terrain.width * terrain.horizontal_scale
+    scaled_length = terrain.length * terrain.horizontal_scale
 
     # switch parameters to discrete units
     min_height = int(min_height / terrain.vertical_scale)
@@ -69,19 +72,19 @@ def random_uniform_terrain(
     height_field_downsampled = np.random.choice(
         heights_range,
         (
-            int(terrain.width * terrain.horizontal_scale / downsampled_scale),
-            int(terrain.length * terrain.horizontal_scale / downsampled_scale),
+            int(scaled_width / downsampled_scale),
+            int(scaled_length / downsampled_scale),
         ),
     )
 
-    x = np.linspace(0, terrain.width * terrain.horizontal_scale, height_field_downsampled.shape[0])
-    y = np.linspace(0, terrain.length * terrain.horizontal_scale, height_field_downsampled.shape[1])
+    x = np.linspace(0, scaled_width, height_field_downsampled.shape[0])
+    y = np.linspace(0, scaled_length, height_field_downsampled.shape[1])
 
-    f = interpolate.RegularGridInterpolator((y, x), height_field_downsampled, method="linear")
-
-    x_upsampled = np.linspace(0, terrain.width * terrain.horizontal_scale, terrain.width)
-    y_upsampled = np.linspace(0, terrain.length * terrain.horizontal_scale, terrain.length)
-    z_upsampled = np.rint(f((y_upsampled, x_upsampled)))
+    x_upsampled = np.linspace(0, scaled_width, terrain.width)
+    y_upsampled = np.linspace(0, scaled_length, terrain.length)
+    z_upsampled = np.rint(
+        gu.cubic_spline_1d(x, gu.cubic_spline_1d(y, height_field_downsampled.T, y_upsampled).T, x_upsampled)
+    )
 
     terrain.height_field_raw += z_upsampled
     return terrain
@@ -162,23 +165,23 @@ def discrete_obstacles_terrain(terrain, max_height, min_size, max_size, num_rect
     max_size = int(max_size / terrain.horizontal_scale)
     platform_size = int(platform_size / terrain.horizontal_scale)
 
-    (i, j) = terrain.height_field_raw.shape
-    height_range = [-max_height, -max_height // 2, max_height // 2, max_height]
-    width_range = range(min_size, max_size, 4)
-    length_range = range(min_size, max_size, 4)
+    grid_size_x, grid_size_y = terrain.height_field_raw.shape
+    width_choices = np.arange(min(min_size, grid_size_x - 1), min(max_size, grid_size_x - 1) + 1, 4)
+    length_choices = np.arange(min(min_size, grid_size_y - 1), min(max_size, grid_size_y - 1) + 1, 4)
+    height_choices = [-max_height, -max_height // 2, max_height // 2, max_height]
 
     for _ in range(num_rects):
-        width = np.random.choice(width_range)
-        length = np.random.choice(length_range)
-        start_i = np.random.choice(range(0, i - width, 4))
-        start_j = np.random.choice(range(0, j - length, 4))
-        terrain.height_field_raw[start_i : start_i + width, start_j : start_j + length] = np.random.choice(height_range)
+        width = np.random.choice(width_choices)
+        length = np.random.choice(length_choices)
+        height = np.random.choice(height_choices)
+        start_x = np.random.choice(range(0, grid_size_x - width, 4))
+        start_y = np.random.choice(range(0, grid_size_y - length, 4))
+        terrain.height_field_raw[start_x : start_x + width, start_y : start_y + length] = height
 
-    x1 = (terrain.width - platform_size) // 2
-    x2 = (terrain.width + platform_size) // 2
-    y1 = (terrain.length - platform_size) // 2
-    y2 = (terrain.length + platform_size) // 2
-    terrain.height_field_raw[x1:x2, y1:y2] = 0
+    start_x, end_x = (terrain.width - platform_size) // 2, (terrain.width + platform_size) // 2
+    start_y, end_y = (terrain.length - platform_size) // 2, (terrain.length + platform_size) // 2
+    terrain.height_field_raw[start_x:end_x, start_y:end_y] = 0
+
     return terrain
 
 
@@ -349,7 +352,6 @@ def convert_heightfield_to_trimesh(height_field_raw, horizontal_scale, vertical_
     yy, xx = np.meshgrid(y, x)
 
     if slope_threshold is not None:
-
         slope_threshold *= horizontal_scale / vertical_scale
         move_x = np.zeros((num_rows, num_cols))
         move_y = np.zeros((num_rows, num_cols))

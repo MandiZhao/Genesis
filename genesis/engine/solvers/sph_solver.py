@@ -34,7 +34,7 @@ class SPHSolver(Solver):
         self._upper_bound = np.array(options.upper_bound)
         self._lower_bound = np.array(options.lower_bound)
 
-        self._p_vol = 0.8 * self._particle_size**3  # 0.8 is an empirical value
+        self._particle_volume = 0.8 * self._particle_size**3  # 0.8 is an empirical value
 
         # spatial hasher
         self.sh = gu.SpatialHasher(
@@ -44,16 +44,8 @@ class SPHSolver(Solver):
         # boundary
         self.setup_boundary()
 
-    def _batch_shape(self, shape=None, first_dim=False, B=None):
-        if B is None:
-            B = self._B
-
-        if shape is None:
-            return (B,)
-        elif isinstance(shape, (list, tuple)):
-            return (B,) + shape if first_dim else shape + (B,)
-        else:
-            return (B, shape) if first_dim else (shape, B)
+        # Coefficient for computing stable timestep
+        self._stable_dt_coef = 1.0
 
     def setup_boundary(self):
         self.boundary = CubeBoundary(
@@ -99,26 +91,26 @@ class SPHSolver(Solver):
 
         # construct fields
         self.particles = struct_particle_state.field(
-            shape=self._batch_shape((self._n_particles,)), needs_grad=False, layout=ti.Layout.SOA
+            shape=(self._n_particles, self._B), needs_grad=False, layout=ti.Layout.SOA
         )
         self.particles_ng = struct_particle_state_ng.field(
-            shape=self._batch_shape((self._n_particles,)), needs_grad=False, layout=ti.Layout.SOA
+            shape=(self._n_particles, self._B), needs_grad=False, layout=ti.Layout.SOA
         )
         self.particles_info = struct_particle_info.field(
-            shape=(self._n_particles,), needs_grad=False, layout=ti.Layout.SOA  # <- unchanged
+            shape=(self._n_particles,), needs_grad=False, layout=ti.Layout.SOA
         )
         self.particles_reordered = struct_particle_state.field(
-            shape=self._batch_shape((self._n_particles,)), needs_grad=False, layout=ti.Layout.SOA
+            shape=(self._n_particles, self._B), needs_grad=False, layout=ti.Layout.SOA
         )
         self.particles_ng_reordered = struct_particle_state_ng.field(
-            shape=self._batch_shape((self._n_particles,)), needs_grad=False, layout=ti.Layout.SOA
+            shape=(self._n_particles, self._B), needs_grad=False, layout=ti.Layout.SOA
         )
         self.particles_info_reordered = struct_particle_info.field(
-            shape=self._batch_shape((self._n_particles,)), needs_grad=False, layout=ti.Layout.SOA
+            shape=(self._n_particles, self._B), needs_grad=False, layout=ti.Layout.SOA
         )
 
         self.particles_render = struct_particle_state_render.field(
-            shape=self._batch_shape((self._n_particles,)), needs_grad=False, layout=ti.Layout.SOA
+            shape=(self._n_particles, self._B), needs_grad=False, layout=ti.Layout.SOA
         )
 
     def init_ckpt(self):
@@ -129,6 +121,7 @@ class SPHSolver(Solver):
 
     def build(self):
         super().build()
+
         self._B = self._sim._B
 
         # particles and entities
@@ -136,7 +129,7 @@ class SPHSolver(Solver):
 
         self._coupler = self.sim._coupler
 
-        if self.is_active():
+        if self.is_active:
             self.sh.build(self._B)
             self.init_particle_fields()
             self.init_ckpt()
@@ -144,12 +137,35 @@ class SPHSolver(Solver):
             for entity in self.entities:
                 entity._add_to_solver()
 
-            # TODO: @Mingrui: this is a temporary hack. Need to support per-particle density
+            # Compute stable timestep for the given particle properties (mu) and support radius and print warning
+            # if the current timestep is larger than the stable timestep. This formula is derived from
+            # [_task_compute_non_pressure_forces] function, which computes the acceleration due to non-pressure forces.
+            stable_dt = (
+                self._stable_dt_coef * (0.01 * self._support_radius**2) / self.particles_info.mu.to_numpy().max()
+            )
+            if self.substep_dt > stable_dt:
+                gs.logger.warning(
+                    f"Current timestep ({self.substep_dt:.4g}) is larger than the stable timestep "
+                    f"({stable_dt:.4g}) for SPH solver. "
+                    "Please consider reducing the timestep, liquid viscosity (mu), or increasing the particle size."
+                )
+
+            # TODO: Support per-particle density
             self._density0 = self.particles_info[0].rho
+
+        # Overwrite gravity because only field is supported for now
+        if self._gravity is not None:
+            gravity = self._gravity.to_numpy()
+            self._gravity = ti.field(dtype=gs.ti_vec3, shape=(self._B,))
+            self._gravity.from_numpy(gravity)
 
     # ------------------------------------------------------------------------------------
     # -------------------------------------- misc ----------------------------------------
     # ------------------------------------------------------------------------------------
+
+    @property
+    def is_active(self):
+        return self.n_particles > 0
 
     def add_entity(self, idx, material, morph, surface):
         entity = SPHEntity(
@@ -165,9 +181,6 @@ class SPHSolver(Solver):
 
         self.entities.append(entity)
         return entity
-
-    def is_active(self):
-        return self.n_particles > 0
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- simulation -------------------------------------
@@ -213,7 +226,7 @@ class SPHSolver(Solver):
 
     @ti.func
     def _task_compute_rho(self, i, j, ret: ti.template(), i_b):
-        ret += self._p_vol * self.cubic_kernel(
+        ret += self._particle_volume * self.cubic_kernel(
             (self.particles_reordered[i, i_b].pos - self.particles_reordered[j, i_b].pos).norm()
         )
 
@@ -222,9 +235,9 @@ class SPHSolver(Solver):
         for i_p, i_b in ti.ndrange(self._n_particles, self._B):
             if self.particles_ng_reordered[i_p, i_b].active:
                 # Base density using the kernel at distance 0
-                self.particles_reordered[i_p, i_b].rho = self._p_vol * self.cubic_kernel(0.0)
+                self.particles_reordered[i_p, i_b].rho = self._particle_volume * self.cubic_kernel(0.0)
 
-                den = 0.0
+                den = gs.ti_float(0.0)
                 self.sh.for_all_neighbors(
                     i_p, self.particles_reordered.pos, self._support_radius, den, self._task_compute_rho, i_b
                 )
@@ -306,7 +319,7 @@ class SPHSolver(Solver):
         # Compute the pressure force contribution, Symmetric Formula
         ret += (
             -self.particles_info_reordered[j, i_b].rho
-            * self._p_vol
+            * self._particle_volume
             * (dp_i + dp_j)
             * self.cubic_kernel_derivative(self.particles_reordered[i, i_b].pos - self.particles_reordered[j, i_b].pos)
         )
@@ -368,7 +381,7 @@ class SPHSolver(Solver):
     @ti.func
     def _task_compute_DFSPH_factor(self, i, j, ret: ti.template(), i_b):
         # Fluid neighbors
-        grad_j = -self._p_vol * self.cubic_kernel_derivative(
+        grad_j = -self._particle_volume * self.cubic_kernel_derivative(
             self.particles_reordered[i, i_b].pos - self.particles_reordered[j, i_b].pos
         )
         ret[3] += grad_j.norm_sqr()  # sum_grad_p_k
@@ -379,14 +392,14 @@ class SPHSolver(Solver):
     def _kernel_compute_DFSPH_factor(self, f: ti.i32):
         for i_p, i_b in ti.ndrange(self._n_particles, self._B):
             if self.particles_ng_reordered[i_p, i_b].active:
-                sum_grad_p_k = 0.0
+                sum_grad_p_k = gs.ti_float(0.0)
                 grad_p_i = ti.Vector.zero(gs.ti_float, 3)
 
                 # `ret` concatenates `grad_p_i` and `sum_grad_p_k`
                 ret = ti.Vector.zero(gs.ti_float, 4)
 
                 self.sh.for_all_neighbors(
-                    i, self.particles_reordered.pos, self._support_radius, ret, self._task_compute_DFSPH_factor
+                    i_p, self.particles_reordered.pos, self._support_radius, ret, self._task_compute_DFSPH_factor
                 )
 
                 sum_grad_p_k = ret[3]
@@ -395,7 +408,7 @@ class SPHSolver(Solver):
                 sum_grad_p_k += grad_p_i.norm_sqr()
 
                 # Compute pressure stiffness denominator
-                factor = 0.0
+                factor = gs.ti_float(0.0)
                 if sum_grad_p_k > 1e-6:
                     factor = -1.0 / sum_grad_p_k
                 else:
@@ -411,7 +424,7 @@ class SPHSolver(Solver):
         x_j = self.particles_reordered[j, i_b].pos
 
         # Fluid neighbors
-        ret.drho += self._p_vol * (v_i - v_j).dot(self.cubic_kernel_derivative(x_i - x_j))
+        ret.drho += self._particle_volume * (v_i - v_j).dot(self.cubic_kernel_derivative(x_i - x_j))
         ret.num_neighbors += 1
 
     @ti.kernel
@@ -447,7 +460,7 @@ class SPHSolver(Solver):
             self._density0 / self._density0 * ret.k_i + k_j
         )  # TODO: make the neighbor density different for multiphase fluid
         if ti.abs(k_sum) > self._df_eps:
-            grad_p_j = -self._p_vol * self.cubic_kernel_derivative(
+            grad_p_j = -self._particle_volume * self.cubic_kernel_derivative(
                 self.particles_reordered.pos[i, i_b] - self.particles_reordered.pos[j, i_b]
             )
             ret.dv -= (
@@ -472,7 +485,7 @@ class SPHSolver(Solver):
 
     @ti.kernel
     def _kernel_compute_density_error(self, offset: float) -> float:
-        density_error = 0.0
+        density_error = gs.ti_float(0.0)
         for i_p, i_b in ti.ndrange(self._n_particles, self._B):
             if self.particles_ng_reordered[i_p, i_b].active:
                 density_error += self._density0 * self.particles_reordered[i_p, i_b].drho - offset
@@ -491,13 +504,10 @@ class SPHSolver(Solver):
         inv_dt = 1 / self._substep_dt
         # self._kernel_multiply_time_step(self.ps.dfsph_factor, inv_dt)
 
-        iteration = 0
-
         # Start solver
-        avg_density_err = 0.0
-
+        iteration = gs.ti_int(0)
+        avg_density_err = gs.ti_float(0.0)
         while iteration < self._df_max_div_iters:
-
             avg_density_err = self._divergence_solver_iteration()
             # Max allowed density fluctuation
             # The SI unit for divergence is s^-1, use max density error divided by time step size
@@ -530,13 +540,13 @@ class SPHSolver(Solver):
         v_j = self.particles_reordered[j, i_b].vel
         x_i = self.particles_reordered[i, i_b].pos
         x_j = self.particles_reordered[j, i_b].pos
-        ret += self._p_vol * (v_i - v_j).dot(self.cubic_kernel_derivative(x_i - x_j))
+        ret += self._particle_volume * (v_i - v_j).dot(self.cubic_kernel_derivative(x_i - x_j))
 
     @ti.kernel
     def _kernel_compute_density_star(self):
         for i_p, i_b in ti.ndrange(self._n_particles, self._B):
             if self.particles_ng_reordered[i_p, i_b].active:
-                delta = 0.0
+                delta = gs.ti_float(0.0)
                 self.sh.for_all_neighbors(
                     i_p, self.particles_reordered.pos, self._support_radius, delta, self._task_compute_density_star, i_b
                 )
@@ -552,7 +562,7 @@ class SPHSolver(Solver):
             self._density0 / self._density0 * ret.k_i + k_j
         )  # TODO: make the neighbor density0 different for multiphase fluid
         if ti.abs(k_sum) > self._df_eps:
-            grad_p_j = -self._p_vol * self.cubic_kernel_derivative(
+            grad_p_j = -self._particle_volume * self.cubic_kernel_derivative(
                 self.particles_reordered[i, i_b].pos - self.particles_reordered[j, i_b].pos
             )
             # Directly update velocities instead of storing pressure accelerations
@@ -591,20 +601,16 @@ class SPHSolver(Solver):
                 field[i_p, i_b] *= time_step
 
     def _density_solve(self, f: ti.i32):
-        inv_dt2 = 1 / (self._substep_dt * self._substep_dt)
-
-        # TODO: warm start
+        inv_dt2 = 1.0 / self._substep_dt**2
 
         # Compute density star
         self._kernel_compute_density_star()
 
         self._kernel_multiply_time_step(self.particles_reordered.dfsph_factor, inv_dt2)
 
-        iteration = 0
-
         # Start solver
-        avg_density_err = 0.0
-
+        iteration = gs.ti_int(0)
+        avg_density_err = gs.ti_float(0.0)
         while iteration < self._df_max_den_iters:
             avg_density_err = self._density_solve_iteration()
             # Max allowed density fluctuation
@@ -615,52 +621,45 @@ class SPHSolver(Solver):
 
         gs.logger.debug(f"DFSPH - iterations: {iteration} Avg density err: {avg_density_err:.4f} kg/m^3")
 
-        # Multiply by h, the time step size has to be removed
-        # to make the stiffness value independent
-        # of the time step size
-
-        # TODO: if warm start
-        # also remove for kappa v
-
     # ------------------------------------------------------------------------------------
     # ------------------------------------- utils ----------------------------------------
     # ------------------------------------------------------------------------------------
 
     @ti.func
     def cubic_kernel(self, r_norm):
+        """
+        Cubic spline smoothing kernel.
+        """
         res = gs.ti_float(0.0)
         h = self._support_radius
-        # value of cubic spline smoothing kernel
-        k = 1.0
-        k = 8 / np.pi
-        k /= h**3
+        k = 8.0 / np.pi / h**3
         q = r_norm / h
         if q <= 1.0:
             if q <= 0.5:
-                q2 = q * q
+                q2 = q**2
                 q3 = q2 * q
-                res = k * (6.0 * q3 - 6.0 * q2 + 1)
+                res = k * (6.0 * q3 - 6.0 * q2 + 1.0)
             else:
-                res = k * 2 * ti.pow(1 - q, 3.0)
+                res = 2 * k * (1.0 - q) ** 3
         return res
 
     @ti.func
     def cubic_kernel_derivative(self, r):
-        h = self._support_radius
-        # derivative of cubic spline smoothing kernel
-        k = 1.0
-        k = 8 / np.pi
-        k = 6.0 * k / h**3
-        r_norm = r.norm()
-        q = r_norm / h
+        """
+        Derivative of cubic spline smoothing kernel.
+        """
         res = ti.Vector.zero(gs.ti_float, 3)
+
+        r_norm = r.norm()
+        h = self._support_radius
+        k = 8.0 / np.pi / h**3
+        q = r_norm / h
         if r_norm > 1e-5 and q <= 1.0:
             grad_q = r / (r_norm * h)
             if q <= 0.5:
-                res = k * q * (3.0 * q - 2.0) * grad_q
+                res = 6.0 * k * q * (3.0 * q - 2.0) * grad_q
             else:
-                factor = 1.0 - q
-                res = k * (-factor * factor) * grad_q
+                res = -6.0 * k * (1.0 - q) ** 2 * grad_q
         return res
 
     # ------------------------------------------------------------------------------------
@@ -676,7 +675,7 @@ class SPHSolver(Solver):
             entity.process_input_grad()
 
     def substep_pre_coupling(self, f):
-        if self.is_active():
+        if self.is_active:
             self._kernel_reorder_particles(f)
             if self._pressure_solver == "WCSPH":
                 self._kernel_compute_rho(f)
@@ -696,7 +695,7 @@ class SPHSolver(Solver):
         pass
 
     def substep_post_coupling(self, f):
-        if self.is_active():
+        if self.is_active:
             self._kernel_advect_position(f)
             self._kernel_copy_from_reordered(f)
 
@@ -716,15 +715,68 @@ class SPHSolver(Solver):
     def add_grad_from_state(self, state):
         pass
 
+    # ------------------------------------------------------------------------------------
+    # --------------------------------------- io -----------------------------------------
+    # ------------------------------------------------------------------------------------
+
     def save_ckpt(self, ckpt_name):
         pass
 
     def load_ckpt(self, ckpt_name):
         pass
 
-    # ------------------------------------------------------------------------------------
-    # --------------------------------------- io -----------------------------------------
-    # ------------------------------------------------------------------------------------
+    def set_state(self, f, state, envs_idx=None):
+        if self.is_active:
+            self._kernel_set_state(f, state.pos, state.vel, state.active)
+
+    @ti.kernel
+    def _kernel_set_state(
+        self,
+        f: ti.i32,
+        pos: ti.types.ndarray(),
+        vel: ti.types.ndarray(),
+        active: ti.types.ndarray(),
+    ):
+        for i_p, i_b in ti.ndrange(self._n_particles, self._B):
+            for j in ti.static(range(3)):
+                self.particles[i_p, i_b].pos[j] = pos[i_b, i_p, j]
+                self.particles[i_p, i_b].vel[j] = vel[i_b, i_p, j]
+            self.particles_ng[i_p, i_b].active = active[i_b, i_p]
+
+    def get_state(self, f):
+        if self.is_active:
+            state = SPHSolverState(self.scene)
+            self._kernel_get_state(f, state.pos, state.vel, state.active)
+        else:
+            state = None
+        return state
+
+    @ti.kernel
+    def _kernel_get_state(
+        self,
+        f: ti.i32,
+        pos: ti.types.ndarray(),
+        vel: ti.types.ndarray(),
+        active: ti.types.ndarray(),
+    ):
+        for i_p, i_b in ti.ndrange(self._n_particles, self._B):
+            for j in ti.static(range(3)):
+                pos[i_b, i_p, j] = self.particles[i_p, i_b].pos[j]
+                vel[i_b, i_p, j] = self.particles[i_p, i_b].vel[j]
+            active[i_b, i_p] = self.particles_ng[i_p, i_b].active
+
+    def update_render_fields(self):
+        self._kernel_update_render_fields(self.sim.cur_substep_local)
+
+    @ti.kernel
+    def _kernel_update_render_fields(self, f: ti.i32):
+        for i_p, i_b in ti.ndrange(self._n_particles, self._B):
+            if self.particles_ng[i_p, i_b].active:
+                self.particles_render[i_p, i_b].pos = self.particles[i_p, i_b].pos
+                self.particles_render[i_p, i_b].vel = self.particles[i_p, i_b].vel
+            else:
+                self.particles_render[i_p, i_b].pos = gu.ti_nowhere()
+            self.particles_render[i_p, i_b].active = self.particles_ng[i_p, i_b].active
 
     @ti.kernel
     def _kernel_add_particles(
@@ -740,121 +792,115 @@ class SPHSolver(Solver):
         mat_gamma: ti.f32,
         pos: ti.types.ndarray(),
     ):
-        for i_p, i_b in ti.ndrange(n_particles, self._B):
-            i_global = i_p + particle_start
-            self.particles_ng[i_global, i_b].active = ti.cast(active, gs.ti_bool)
-            for j in ti.static(range(3)):
-                self.particles[i_global, i_b].pos[j] = pos[i_p, j]
-            self.particles[i_global, i_b].vel = ti.Vector.zero(gs.ti_float, 3)
-            self.particles[i_global, i_b].p = 0
+        for i_p_, i_b in ti.ndrange(n_particles, self._B):
+            i_p = i_p_ + particle_start
+            self.particles_ng[i_p, i_b].active = ti.cast(active, gs.ti_bool)
+            for i in ti.static(range(3)):
+                self.particles[i_p, i_b].pos[i] = pos[i_p_, i]
+            self.particles[i_p, i_b].vel = ti.Vector.zero(gs.ti_float, 3)
+            self.particles[i_p, i_b].p = 0
 
-        for i_p in range(n_particles):
-            i_global = i_p + particle_start
+        for i_p_ in range(n_particles):
+            i_p = i_p_ + particle_start
+            self.particles_info[i_p].rho = mat_rho
+            self.particles_info[i_p].stiffness = mat_stiffness
+            self.particles_info[i_p].exponent = mat_exponent
+            self.particles_info[i_p].mu = mat_mu
+            self.particles_info[i_p].gamma = mat_gamma
+            self.particles_info[i_p].mass = self._particle_volume * mat_rho
 
-            self.particles_info[i_global].rho = mat_rho
-            self.particles_info[i_global].stiffness = mat_stiffness
-            self.particles_info[i_global].exponent = mat_exponent
-            self.particles_info[i_global].mu = mat_mu
-            self.particles_info[i_global].gamma = mat_gamma
-            self.particles_info[i_global].mass = self._p_vol * mat_rho
-
-    @ti.kernel
-    def _kernel_set_particles_active(
-        self,
-        f: ti.i32,
-        particle_start: ti.i32,
-        n_particles: ti.i32,
-        active: ti.i32,
-    ):
-        for i_p, i_b in ti.ndrange(n_particles, self._B):
-            i_global = i_p + particle_start
-            self.particles_ng[i_global, i_b].active = active
+    # ----------------------------------------------------------------------
 
     @ti.kernel
     def _kernel_set_particles_pos(
         self,
-        f: ti.i32,
+        particles_idx: ti.types.ndarray(),
+        envs_idx: ti.types.ndarray(),
+        poss: ti.types.ndarray(),
+    ):
+        for i_p_, i_b_ in ti.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
+            i_p = particles_idx[i_b_, i_p_]
+            i_b = envs_idx[i_b_]
+            for i in ti.static(range(3)):
+                self.particles[i_p, i_b].pos[i] = poss[i_b_, i_p_, i]
+            self.particles[i_p, i_b].vel.fill(0.0)
+            self.particles[i_p, i_b].acc.fill(0.0)
+
+    @ti.kernel
+    def _kernel_get_particles_pos(
+        self,
         particle_start: ti.i32,
         n_particles: ti.i32,
-        pos: ti.types.ndarray(),
+        envs_idx: ti.types.ndarray(),
+        poss: ti.types.ndarray(),
     ):
-        for i_p, i_b in ti.ndrange(n_particles, self._B):
-            i_global = i_p + particle_start
-            for k in ti.static(range(3)):
-                self.particles[i_global, i_b].pos[k] = pos[i_b, i_p, k]
-
-            # we reset vel and acc when directly setting pos
-            self.particles[i_global, i_b].vel.fill(0.0)
-            self.particles[i_global, i_b].acc.fill(0.0)
+        for i_p_, i_b_ in ti.ndrange(n_particles, envs_idx.shape[0]):
+            i_p = i_p_ + particle_start
+            i_b = envs_idx[i_b_]
+            for i in ti.static(range(3)):
+                poss[i_b_, i_p_, i] = self.particles[i_p, i_b].pos[i]
 
     @ti.kernel
     def _kernel_set_particles_vel(
         self,
-        f: ti.i32,
+        particles_idx: ti.types.ndarray(),
+        envs_idx: ti.types.ndarray(),
+        vels: ti.types.ndarray(),
+    ):
+        for i_p_, i_b_ in ti.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
+            i_p = particles_idx[i_b_, i_p_]
+            i_b = envs_idx[i_b_]
+            for i in ti.static(range(3)):
+                self.particles[i_p, i_b].vel[i] = vels[i_b_, i_p_, i]
+            self.particles[i_p, i_b].acc = ti.Vector.zero(gs.ti_float, 3)
+
+    @ti.kernel
+    def _kernel_get_particles_vel(
+        self,
         particle_start: ti.i32,
         n_particles: ti.i32,
-        vel: ti.types.ndarray(),
+        envs_idx: ti.types.ndarray(),
+        vels: ti.types.ndarray(),
     ):
-        for i_p, i_b in ti.ndrange(n_particles, self._B):
-            i_global = i_p + particle_start
-            for k in ti.static(range(3)):
-                self.particles[i_global, i_b].vel[k] = vel[i_b, i_p, k]
-
-            # we reset acc when directly setting vel
-            self.particles[i_global, i_b].acc = ti.Vector.zero(gs.ti_float, 3)
+        for i_p_, i_b_ in ti.ndrange(n_particles, envs_idx.shape[0]):
+            i_p = i_p_ + particle_start
+            i_b = envs_idx[i_b_]
+            for i in ti.static(range(3)):
+                vels[i_b_, i_p_, i] = self.particles[i_p, i_b].vel[i]
 
     @ti.kernel
-    def get_frame(
+    def _kernel_set_particles_active(
         self,
-        f: ti.i32,
-        pos: ti.types.ndarray(),
-        vel: ti.types.ndarray(),
-        active: ti.types.ndarray(),
+        particles_idx: ti.types.ndarray(),
+        envs_idx: ti.types.ndarray(),
+        actives: ti.types.ndarray(),  # shape [B, n_particles]
     ):
-        for i_p, i_b in ti.ndrange(self._n_particles, self._B):
-            for j in ti.static(range(3)):
-                pos[i_b, i_p, j] = self.particles[i_p, i_b].pos[j]
-                vel[i_b, i_p, j] = self.particles[i_p, i_b].vel[j]
-            active[i_b, i_p] = self.particles_ng[i_p, i_b].active
+        for i_p_, i_b_ in ti.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
+            i_p = particles_idx[i_b_, i_p_]
+            i_b = envs_idx[i_b_]
+            self.particles_ng[i_p, i_b].active = actives[i_b_, i_p_]
 
     @ti.kernel
-    def set_frame(
+    def _kernel_get_particles_active(
         self,
-        f: ti.i32,
-        pos: ti.types.ndarray(),
-        vel: ti.types.ndarray(),
-        active: ti.types.ndarray(),
+        particle_start: ti.i32,
+        n_particles: ti.i32,
+        envs_idx: ti.types.ndarray(),
+        actives: ti.types.ndarray(),  # shape [B, n_particles]
     ):
-        for i_p, i_b in ti.ndrange(self._n_particles, self._B):
-            for j in ti.static(range(3)):
-                self.particles[i_p, i_b].pos[j] = pos[i_b, i_p, j]
-                self.particles[i_p, i_b].vel[j] = vel[i_b, i_p, j]
-            self.particles_ng[i_p, i_b].active = active[i_b, i_p]
-
-    def set_state(self, f, state, envs_idx=None):
-        if self.is_active():
-            self.set_frame(f, state.pos, state.vel, state.active)
-
-    def get_state(self, f):
-        if self.is_active():
-            state = SPHSolverState(self.scene)
-            self.get_frame(f, state.pos, state.vel, state.active)
-        else:
-            state = None
-        return state
+        for i_p_, i_b_ in ti.ndrange(n_particles, envs_idx.shape[0]):
+            i_p = i_p_ + particle_start
+            i_b = envs_idx[i_b_]
+            actives[i_b_, i_p_] = self.particles_ng[i_p, i_b].active
 
     @ti.kernel
-    def _kernel_update_render_fields(self, f: ti.i32):
-        for i_p, i_b in ti.ndrange(self._n_particles, self._B):
-            if self.particles_ng[i_p, i_b].active:
-                self.particles_render[i_p, i_b].pos = self.particles[i_p, i_b].pos
-                self.particles_render[i_p, i_b].vel = self.particles[i_p, i_b].vel
-            else:
-                self.particles_render[i_p, i_b].pos = gu.ti_nowhere()
-            self.particles_render[i_p, i_b].active = self.particles_ng[i_p, i_b].active
-
-    def update_render_fields(self):
-        self._kernel_update_render_fields(self.sim.cur_substep_local)
+    def _kernel_get_mass(
+        self, particle_start: ti.i32, n_particles: ti.i32, mass: ti.types.ndarray(), envs_idx: ti.types.ndarray()
+    ):
+        for i_p_, i_b_ in ti.ndrange(n_particles, envs_idx.shape[0]):
+            i_p = i_p_ + particle_start
+            i_b = envs_idx[i_b_]
+            mass[i_b_] += self.particles[i_p, i_b].m
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------
@@ -868,8 +914,8 @@ class SPHSolver(Solver):
             return sum([entity.n_particles for entity in self._entities])
 
     @property
-    def p_vol(self):
-        return self._p_vol
+    def particle_volume(self):
+        return self._particle_volume
 
     @property
     def particle_size(self):

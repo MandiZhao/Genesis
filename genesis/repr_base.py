@@ -52,7 +52,7 @@ class RBC:
             if isinstance(getattr(self.__class__, attr, None), property):
                 property_attrs.append(attr)
 
-        max_attr_len = max([len(attr) for attr in property_attrs])
+        max_attr_len = max([len(attr) for attr in property_attrs]) if property_attrs else 0
 
         repr_str = ""
         # sort property attrs
@@ -64,11 +64,11 @@ class RBC:
             # content example: <gs.List>(len=0, [])
             try:
                 content = ru.brief(getattr(self, attr))
-            except:
+            except Exception:
                 continue
             idx = content.find(">")
             # format with italic and color
-            formatted_content = f"{colors.MINT}{formats.ITALIC}{content[:idx + 1]}{formats.RESET}{colors.MINT}{content[idx + 1:]}{formats.RESET}"
+            formatted_content = f"{colors.MINT}{formats.ITALIC}{content[: idx + 1]}{formats.RESET}{colors.MINT}{content[idx + 1 :]}{formats.RESET}"
             # in case it's multi-line
             if isinstance(getattr(self, attr), gs.List):
                 # 4 = 2 x ' + : + space

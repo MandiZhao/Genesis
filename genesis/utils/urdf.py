@@ -2,14 +2,14 @@ import os
 from itertools import chain
 from pathlib import Path
 
-import trimesh
 import numpy as np
+import trimesh
 
 import genesis as gs
+import genesis.utils.gltf as gltf_utils
 from genesis.ext import urdfpy
 
 from . import geom as gu
-from . import mesh as mu
 from .misc import get_assets_dir
 
 
@@ -101,55 +101,78 @@ def parse_urdf(morph, surface):
             l_info["inertial_i"] = link.inertial.inertia
             l_info["inertial_mass"] = link.inertial.mass
 
-        for geom in (*link.collisions, *link.visuals):
+        for geom_prop in (*link.collisions, *link.visuals):
             link_g_infos_ = []
-            geom_is_col = not isinstance(geom, urdfpy.Visual)
-            if isinstance(geom.geometry.geometry, urdfpy.Mesh):
+            geom_is_col = not isinstance(geom_prop, urdfpy.Visual)
+            geometry = geom_prop.geometry.geometry
+            if isinstance(geometry, urdfpy.Mesh):
                 geom_type = gs.GEOM_TYPE.MESH
                 geom_data = None
 
-                # One asset (.obj) can contain multiple meshes. Each mesh is one RigidGeom in genesis.
-                for tmesh in geom.geometry.meshes:
-                    scale = float(morph.scale)
-                    if geom.geometry.geometry.scale is not None:
-                        scale *= geom.geometry.geometry.scale
+                # Compute the absolute scale of the geometry
+                scale = float(morph.scale)
+                if geometry.scale is not None:
+                    scale *= geometry.scale
 
+                # Overwrite surface color by original color specified in URDF file only if necessary
+                if geom_is_col:
+                    geom_surface = gs.surfaces.Collision()
+                elif (
+                    not geom_is_col
+                    and getattr(geom_prop, "material") is not None
+                    and geom_prop.material.color is not None
+                    and (morph.prioritize_urdf_material or surface.color is None)
+                ):
+                    geom_surface = surface.copy()
+                    geom_surface.color = geom_prop.material.color
+                else:
+                    geom_surface = surface
+
+                mesh_path = urdfpy.utils.get_filename(os.path.dirname(path), geometry.filename)
+                if mesh_path.lower().endswith(gs.options.morphs.GLTF_FORMATS):
+                    group_material = True
+                    meshes = gltf_utils.parse_mesh_glb(mesh_path, group_material, morph.scale, geom_surface)
+                    geometry._meshes = [mesh.trimesh for mesh in meshes]
+
+                # One asset (.obj) can contain multiple meshes. Each mesh is one RigidGeom in genesis.
+                for i, tmesh in enumerate(geometry.meshes):
                     mesh = gs.Mesh.from_trimesh(
                         tmesh,
                         scale=scale,
-                        surface=gs.surfaces.Collision() if geom_is_col else surface,
-                        metadata={
-                            "mesh_path": urdfpy.utils.get_filename(
-                                os.path.dirname(path), geom.geometry.geometry.filename
-                            )
-                        },
+                        surface=geom_surface,
+                        metadata={"mesh_path": mesh_path},
                     )
 
-                    if not geom_is_col and (morph.prioritize_urdf_material or not tmesh.visual.defined):
-                        if geom.material is not None and geom.material.color is not None:
-                            mesh.set_color(geom.material.color)
+                    if not morph.file_meshes_are_zup:
+                        mesh.convert_to_zup()
+                        if i == 0:
+                            gs.logger.debug(f"Converting the geometry of the '{morph.file}' file to zup.")
 
                     g_info = {"mesh" if geom_is_col else "vmesh": mesh}
                     link_g_infos_.append(g_info)
             else:
-                # Each geometry primitive is one RigidGeom in genesis.
-                if isinstance(geom.geometry.geometry, urdfpy.Box):
-                    tmesh = trimesh.creation.box(extents=geom.geometry.geometry.size)
+                # Each geometry primitive is one RigidGeom in genesis
+                if isinstance(geometry, urdfpy.Box):
+                    tmesh = trimesh.creation.box(extents=geometry.size)
                     geom_type = gs.GEOM_TYPE.BOX
-                    geom_data = np.array(geom.geometry.geometry.size)
-                elif isinstance(geom.geometry.geometry, urdfpy.Cylinder):
-                    tmesh = trimesh.creation.cylinder(
-                        radius=geom.geometry.geometry.radius, height=geom.geometry.geometry.length
-                    )
+                    geom_data = np.array(geometry.size)
+                elif isinstance(geometry, urdfpy.Capsule):
+                    tmesh = trimesh.creation.capsule(radius=geometry.radius, height=geometry.length)
+                    geom_type = gs.GEOM_TYPE.CAPSULE
+                    geom_data = np.array([geometry.radius, geometry.length])
+                elif isinstance(geometry, urdfpy.Cylinder):
+                    tmesh = trimesh.creation.cylinder(radius=geometry.radius, height=geometry.length)
                     geom_type = gs.GEOM_TYPE.CYLINDER
-                    geom_data = None
-                elif isinstance(geom.geometry.geometry, urdfpy.Sphere):
+                    geom_data = np.array([geometry.radius, geometry.length])
+                elif isinstance(geometry, urdfpy.Sphere):
                     if geom_is_col:
-                        tmesh = trimesh.creation.icosphere(radius=geom.geometry.geometry.radius, subdivisions=2)
+                        tmesh = trimesh.creation.icosphere(radius=geometry.radius, subdivisions=2)
                     else:
-                        tmesh = trimesh.creation.icosphere(radius=geom.geometry.geometry.radius)
+                        tmesh = trimesh.creation.icosphere(radius=geometry.radius)
                     geom_type = gs.GEOM_TYPE.SPHERE
-                    geom_data = np.array([geom.geometry.geometry.radius])
+                    geom_data = np.array([geometry.radius])
+                else:
+                    gs.raise_exception(f"Unsupported primitive geometry: {geometry}")
 
                 mesh = gs.Mesh.from_trimesh(
                     tmesh,
@@ -158,8 +181,8 @@ def parse_urdf(morph, surface):
                 )
 
                 if not geom_is_col:
-                    if geom.material is not None and geom.material.color is not None:
-                        mesh.set_color(geom.material.color)
+                    if geom_prop.material is not None and geom_prop.material.color is not None:
+                        mesh.set_color(geom_prop.material.color)
 
                 g_info = {"mesh" if geom_is_col else "vmesh": mesh}
                 link_g_infos_.append(g_info)
@@ -167,8 +190,8 @@ def parse_urdf(morph, surface):
             for g_info in link_g_infos_:
                 g_info["type"] = geom_type
                 g_info["data"] = geom_data
-                g_info["pos"] = geom.origin[:3, 3].copy()
-                g_info["quat"] = gu.R_to_quat(geom.origin[:3, :3])
+                g_info["pos"] = geom_prop.origin[:3, 3].copy()
+                g_info["quat"] = gu.R_to_quat(geom_prop.origin[:3, :3])
                 g_info["contype"] = 1 if geom_is_col else 0
                 g_info["conaffinity"] = 1 if geom_is_col else 0
                 g_info["friction"] = gu.default_friction()
@@ -218,7 +241,6 @@ def parse_urdf(morph, surface):
             j_info["n_qs"] = 1
             j_info["n_dofs"] = 1
             j_info["init_qpos"] = np.zeros(1)
-
         elif joint.joint_type == "continuous":
             j_info["dofs_motion_ang"] = np.array([joint.axis])
             j_info["dofs_motion_vel"] = np.zeros((1, 3))
@@ -229,7 +251,6 @@ def parse_urdf(morph, surface):
             j_info["n_qs"] = 1
             j_info["n_dofs"] = 1
             j_info["init_qpos"] = np.zeros(1)
-
         elif joint.joint_type == "prismatic":
             j_info["dofs_motion_ang"] = np.zeros((1, 3))
             j_info["dofs_motion_vel"] = np.array([joint.axis])
@@ -247,7 +268,6 @@ def parse_urdf(morph, surface):
             j_info["n_qs"] = 1
             j_info["n_dofs"] = 1
             j_info["init_qpos"] = np.zeros(1)
-
         elif joint.joint_type == "floating":
             j_info["dofs_motion_ang"] = np.eye(6, 3, -3)
             j_info["dofs_motion_vel"] = np.eye(6, 3)
@@ -258,46 +278,41 @@ def parse_urdf(morph, surface):
             j_info["n_qs"] = 7
             j_info["n_dofs"] = 6
             j_info["init_qpos"] = np.concatenate([gu.zero_pos(), gu.identity_quat()])
-
         else:
             gs.raise_exception(f"Unsupported URDF joint type: {joint.joint_type}")
 
-        j_info["dofs_invweight"] = np.full((j_info["n_dofs"],), fill_value=-1.0)
-        j_info["dofs_frictionloss"] = np.zeros(j_info["n_dofs"])
         j_info["sol_params"] = gu.default_solver_params()
+        j_info["dofs_invweight"] = np.full((j_info["n_dofs"],), fill_value=-1.0)
+
+        joint_friction, joint_damping = 0.0, 0.0
+        if joint.dynamics is not None:
+            joint_friction, joint_damping = joint.dynamics.friction, joint.dynamics.damping
+        j_info["dofs_frictionloss"] = np.full(j_info["n_dofs"], joint_friction)
+        j_info["dofs_damping"] = np.full(j_info["n_dofs"], joint_damping)
+        j_info["dofs_armature"] = np.zeros(j_info["n_dofs"])
+        if joint.joint_type not in ("floating", "fixed") and morph.default_armature is not None:
+            j_info["dofs_armature"] = np.full((j_info["n_dofs"],), morph.default_armature)
+
         j_info["dofs_kp"] = gu.default_dofs_kp(j_info["n_dofs"])
         j_info["dofs_kv"] = gu.default_dofs_kv(j_info["n_dofs"])
-        # j_info["dofs_force_range"] = np.tile([-np.inf, np.inf], (j_info["n_dofs"], 1)) -> new 
-        j_info["dofs_force_range"] = np.tile([-100.0, 100.0], (j_info["n_dofs"], 1))
-
-        # j_info["dofs_damping"] = np.zeros(j_info["n_dofs"])
-        # j_info["dofs_armature"] = np.zeros(j_info["n_dofs"])
-        # if joint.joint_type not in ("floating", "fixed") and morph.default_armature is not None:
-        #     j_info["dofs_armature"] = np.full((j_info["n_dofs"],), morph.default_armature)
-        if joint.joint_type in ["floating", "fixed"]: # old defaults
-            j_info["dofs_damping"] = np.zeros(j_info["n_dofs"]) 
-            j_info["dofs_armature"] = np.zeros(j_info["n_dofs"]) 
-        else:
-            j_info["dofs_damping"] = np.ones(j_info["n_dofs"])
-            j_info["dofs_armature"] = 0.1 * np.ones(j_info["n_dofs"])
-        
-        if j_info['name'] == "rotation":
-           print('WARNING: Special case for the ARCTIC object joints, set damping to 0.0 and armature to 0.0')
-           j_info['dofs_damping'][:] = 0.1
-           j_info['dofs_stiffness'] *= 0.0
-           j_info['dofs_armature'][:] = 0.0
-           j_info['dofs_kp'] *= 0.0
-           j_info['dofs_kv'] *= 0.0
-
         if joint.safety_controller is not None:
             if joint.safety_controller.k_position is not None:
                 j_info["dofs_kp"] = np.tile(joint.safety_controller.k_position, j_info["n_dofs"])
             if joint.safety_controller.k_velocity is not None:
                 j_info["dofs_kv"] = np.tile(joint.safety_controller.k_velocity, j_info["n_dofs"])
 
+        j_info["dofs_force_range"] = np.tile([-np.inf, np.inf], (j_info["n_dofs"], 1))
         if joint.limit is not None and joint.limit.effort is not None:
             j_info["dofs_force_range"] = np.tile([-joint.limit.effort, joint.limit.effort], (j_info["n_dofs"], 1))
 
+         if j_info['name'] == "rotation":
+           print('WARNING: Special case for the ARCTIC object joints, set damping to 0.0 and armature to 0.0')
+           j_info['dofs_damping'][:] = 0.1
+           j_info['dofs_stiffness'] *= 0.0
+           j_info['dofs_armature'][:] = 0.0
+           j_info['dofs_kp'] *= 0.0
+           j_info['dofs_kv'] *= 0.0
+           
     # Apply scaling factor
     for l_info, link_j_infos, link_g_infos in zip(l_infos, links_j_infos, links_g_infos):
         l_info["pos"] *= morph.scale
@@ -415,6 +430,33 @@ def translate_inertia(I, m, dist):
 def rotate_inertia(I, R):
     """Rotate inertia tensor I by rotation matrix R."""
     return R @ I @ R.T
+
+
+def compose_inertial_properties(mass1, com1, inertia1, mass2, com2, inertia2):
+    """
+    Compose inertial properties of two bodies.
+
+    Args:
+        mass1: Mass of first body
+        com1: Center of mass of first body (3,) array
+        inertia1: Inertia tensor of first body (3,3) array
+        mass2: Mass of second body
+        com2: Center of mass of second body (3,) array
+        inertia2: Inertia tensor of second body (3,3) array
+
+    Returns:
+        combined_mass: Combined mass
+        combined_com: Combined center of mass (3,) array
+        combined_inertia: Combined inertia tensor (3,3) array
+    """
+    combined_mass = mass1 + mass2
+    if combined_mass < gs.EPS:
+        gs.raise_exception("Combined mass is less than EPS")
+    combined_com = (mass1 * com1 + mass2 * com2) / combined_mass
+    inertia1_new = translate_inertia(inertia1, mass1, combined_com - com1)
+    inertia2_new = translate_inertia(inertia2, mass2, combined_com - com2)
+    combined_inertia = inertia1_new + inertia2_new
+    return combined_mass, combined_com, combined_inertia
 
 
 def merge_inertia(link1, link2):

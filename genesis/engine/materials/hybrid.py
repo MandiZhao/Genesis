@@ -10,12 +10,10 @@ class Hybrid(Material):
 
     Parameters
     ----------
-    mat_rigid: gs.materials.base.Material
+    material_rigid: gs.materials.base.Material
         The material of the rigid body.
-    mat_soft: gs.materials.base.Material
+    material_soft: gs.materials.base.Material
         The material of the soft body.
-    fixed: bool, optional
-        Whether the rigid entity is with a fixed base link. Default is False.
     use_default_coupling: bool, optional
         Whether to use default solver coupling. Default is False
     damping: float, optional
@@ -34,9 +32,8 @@ class Hybrid(Material):
 
     def __init__(
         self,
-        mat_rigid,
-        mat_soft,
-        fixed=True,
+        material_rigid,
+        material_soft,
         use_default_coupling=False,
         damping=0.0,
         thickness=0.05,
@@ -47,10 +44,9 @@ class Hybrid(Material):
     ):
         super().__init__()
 
-        self._mat_rigid = mat_rigid
-        self._mat_soft = mat_soft
+        self._material_rigid = material_rigid
+        self._material_soft = material_soft
         self._thickness = thickness
-        self._fixed = fixed
         self._use_default_coupling = use_default_coupling
         self._damping = damping
         self._soft_dv_coef = soft_dv_coef
@@ -59,24 +55,19 @@ class Hybrid(Material):
         self._func_instantiate_rigid_soft_association = func_instantiate_rigid_soft_association
 
     @property
-    def mat_rigid(self):
+    def material_rigid(self):
         """The material of the rigid body."""
-        return self._mat_rigid
+        return self._material_rigid
 
     @property
-    def mat_soft(self):
+    def material_soft(self):
         """The material of the soft body."""
-        return self._mat_soft
+        return self._material_soft
 
     @property
     def thickness(self):
         """The thickness to instantiate soft skin."""
         return self._thickness
-
-    @property
-    def fixed(self):
-        """Whether the rigid entity is with a fixed base link."""
-        return self._fixed
 
     @property
     def use_default_coupling(self):

@@ -1,24 +1,27 @@
-import genesis as gs
+import os
+import argparse
+
 import numpy as np
 import torch
-import argparse
 from tqdm import tqdm
 
-SCENE_POS = (0.5, 0.5, 1.0)
+import genesis as gs
+
+SCENE_POS = np.array([0.5, 0.5, 1.0])
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--solver", choices=["explicit", "implicit"], default="explicit", help="FEM solver type (default: explicit)"
+        "--solver", choices=["explicit", "implicit"], default="implicit", help="FEM solver type (default: implicit)"
     )
-    parser.add_argument("--dt", type=float, help="Time step (auto-selected based on solver if not specified)")
-    parser.add_argument(
-        "--substeps", type=int, help="Number of substeps (auto-selected based on solver if not specified)"
-    )
-    parser.add_argument("--vis", "-v", action="store_true", help="Show visualization GUI")
+    parser.add_argument("--dt", type=float)
+    parser.add_argument("--substeps", type=int)
+    parser.add_argument("--seconds", type=float, default=5)
+    parser.add_argument("--vis", "-v", action="store_true", default=False)
 
     args = parser.parse_args()
+    args.seconds = 0.01 if "PYTEST_VERSION" in os.environ else args.seconds
 
     if args.solver == "explicit":
         dt = args.dt if args.dt is not None else 1e-4
@@ -37,6 +40,7 @@ def main():
         ),
         fem_options=gs.options.FEMOptions(
             use_implicit_solver=args.solver == "implicit",
+            enable_vertex_constraints=True,
         ),
         profiling_options=gs.options.ProfilingOptions(
             show_FPS=False,
@@ -47,13 +51,13 @@ def main():
     scene.add_entity(gs.morphs.Plane())
 
     blob = scene.add_entity(
-        morph=gs.morphs.Sphere(pos=tuple(map(sum, zip(SCENE_POS, (-0.3, -0.3, 0)))), radius=0.1),
-        material=gs.materials.FEM.Elastic(E=1.0e4, nu=0.45, rho=1000.0, model="stable_neohookean"),
+        morph=gs.morphs.Sphere(pos=SCENE_POS + np.array([-0.3, -0.3, 0]), radius=0.1),
+        material=gs.materials.FEM.Elastic(E=1.0e4, nu=0.45, rho=1000.0, model="linear_corotated"),
     )
 
     cube = scene.add_entity(
-        morph=gs.morphs.Box(pos=tuple(map(sum, zip(SCENE_POS, (0.3, 0.3, 0)))), size=(0.2, 0.2, 0.2)),
-        material=gs.materials.FEM.Elastic(E=1.0e6, nu=0.45, rho=1000.0, model="stable_neohookean"),
+        morph=gs.morphs.Box(pos=SCENE_POS + np.array([0.3, 0.3, 0]), size=(0.2, 0.2, 0.2)),
+        material=gs.materials.FEM.Elastic(E=1.0e6, nu=0.45, rho=1000.0, model="linear_corotated"),
     )
 
     video_fps = 1 / dt
@@ -64,7 +68,7 @@ def main():
     cam = scene.add_camera(
         res=(640, 480),
         pos=(-2.0, 3.0, 2.0),
-        lookat=tuple(map(sum, zip(SCENE_POS, (0.0, 0.0, -0.8)))),
+        lookat=SCENE_POS + np.array([0.0, 0.0, -0.8]),
         fov=30,
     )
 
@@ -97,24 +101,16 @@ def main():
         return circle_center + offset
 
     debug_circle = None
-    total_steps = int(5 / dt)  # 5 seconds
+    total_steps = int(args.seconds / dt)
 
     try:
         target_positions = blob.init_positions[pinned_idx]
         scene.draw_debug_spheres(poss=target_positions, radius=0.02, color=(1, 0, 1, 0.8))
-        blob.set_vertex_constraints(
-            verts_idx=pinned_idx,
-            target_poss=target_positions,
-            is_soft_constraint=True,
-            stiffness=1e4,
-        )
+        blob.set_vertex_constraints(pinned_idx, target_positions, is_soft_constraint=True, stiffness=1e4)
 
         target_positions = get_next_circle_position()
         debug_circle = scene.draw_debug_spheres(poss=target_positions, radius=0.02, color=(0, 1, 0, 0.8))
-        cube.set_vertex_constraints(
-            verts_idx=pinned_idx,
-            target_poss=target_positions,
-        )
+        cube.set_vertex_constraints(pinned_idx, target_positions)
 
         for step in tqdm(range(total_steps), total=total_steps):
             if debug_circle is not None:
@@ -122,10 +118,7 @@ def main():
 
             new_pos = get_next_circle_position()
             debug_circle = scene.draw_debug_spheres(poss=new_pos, radius=0.02, color=(0, 1, 0, 0.8))
-            cube.update_constraint_targets(
-                verts_idx=pinned_idx,
-                target_poss=new_pos,
-            )
+            cube.update_constraint_targets(pinned_idx, new_pos)
 
             scene.step()
 

@@ -1,10 +1,8 @@
 import os
 import xml.etree.ElementTree as ET
-import contextlib
 from pathlib import Path
 from itertools import chain
 from bisect import bisect_right
-import io
 
 import numpy as np
 import trimesh
@@ -25,28 +23,48 @@ MIN_TIMECONST = np.finfo(np.double).eps
 
 
 def build_model(xml, discard_visual, default_armature=None, merge_fixed_links=False, links_to_keep=()):
-    if isinstance(xml, (str, Path)):
-        # Make sure that it is pointing to a valid XML content (either file path or string)
-        path = os.path.join(get_assets_dir(), xml)
-        is_valid_path = False
-        try:
-            if os.path.exists(path):
-                xml = ET.parse(path)
-                is_valid_path = True
-            else:
-                xml = ET.fromstring(xml)
-        except ET.ParseError:
-            gs.raise_exception_from(f"'{xml}' is not a valid XML file path or string.")
+    if isinstance(xml, (str, Path, urdfpy.URDF)):
+        if isinstance(xml, urdfpy.URDF):
+            is_urdf_file = True
+            asset_path = get_assets_dir()
+            root = xml._unparse(asset_path)
+            mjcf = ET.SubElement(root, "mujoco")
+        else:
+            # Make sure that it is pointing to a valid XML content (either file path or string)
+            path = os.path.join(get_assets_dir(), xml)
+            is_valid_path = False
+            try:
+                if os.path.exists(path):
+                    xml = ET.parse(path)
+                    is_valid_path = True
+                else:
+                    xml = ET.fromstring(xml)
+            except ET.ParseError:
+                gs.raise_exception_from(f"'{xml}' is not a valid XML file path or string.")
 
-        # Best guess for the search path
-        asset_path = os.path.dirname(path) if is_valid_path else os.getcwd()
+            # Best guess for the search path
+            asset_path = os.path.dirname(path) if is_valid_path else os.getcwd()
 
-        # Detect whether it is a URDF file or a Mujoco MJCF file
-        root = xml.getroot()
-        is_urdf_file = root.tag == "robot"
+            # Detect whether it is a URDF file or a Mujoco MJCF file
+            root = xml.getroot()
+            is_urdf_file = root.tag == "robot"
+            mjcf = ET.SubElement(root, "mujoco") if is_urdf_file else root
+
+        # Parse all included sub-models recursively
+        root_parent_stack = [(mjcf, Path(""))]
+        while root_parent_stack:
+            xml_root, parent_path = root_parent_stack.pop()
+            for elem in tuple(xml_root.findall("include")):
+                include_path = parent_path / elem.attrib["file"]
+                include_root = ET.parse(Path(asset_path) / include_path).getroot()
+                for include_elem in include_root.findall(".//mesh"):
+                    include_elem.attrib["file"] = str(include_path.parent / include_elem.attrib["file"])
+                for child in include_root:
+                    mjcf.append(child)
+                mjcf.remove(elem)
+                root_parent_stack.append((include_root, include_path))
 
         # Make sure compiler options are defined
-        mjcf = ET.SubElement(root, "mujoco") if is_urdf_file else root
         compiler = mjcf.find("compiler")
         if compiler is None:
             compiler = ET.SubElement(mjcf, "compiler")
@@ -107,7 +125,9 @@ def build_model(xml, discard_visual, default_armature=None, merge_fixed_links=Fa
                 mesh_path = elem.get("filename")
                 if mesh_path.startswith("package://"):
                     mesh_path = mesh_path[10:]
-                elem.set("filename", os.path.abspath(os.path.join(asset_path, mesh_path)))
+                # Beware symlinks must NOT be resolved, otherwise it may break the file extension, which is used by
+                # Mujoco MJCF parser to determine how to load mesh files.
+                elem.set("filename", str(Path(asset_path) / mesh_path))
 
         with open(os.devnull, "w") as stderr, redirect_libc_stderr(stderr):
             # Parse updated URDF file as a string
@@ -136,7 +156,7 @@ def build_model(xml, discard_visual, default_armature=None, merge_fixed_links=Fa
     elif isinstance(xml, mujoco.MjModel):
         mj = xml
     else:
-        raise gs.raise_exception(f"'{xml}' is not a valid MJCF file.")
+        gs.raise_exception(f"'{xml}' is not a valid MJCF or URDF file.")
 
     return mj
 
@@ -251,7 +271,7 @@ def parse_link(mj, i_l, scale):
             j_info["dofs_stiffness"] = np.zeros((0))
         elif gs_type == gs.JOINT_TYPE.FREE:
             if mj_stiffness > 0.0:
-                raise gs.raise_exception("(MJCF) Joint stiffness not supported for free joints")
+                gs.raise_exception("(MJCF) Joint stiffness not supported for free joints")
 
             j_info["dofs_motion_ang"] = np.eye(6, 3, -3)
             j_info["dofs_motion_vel"] = np.eye(6, 3)
@@ -308,7 +328,7 @@ def parse_link(mj, i_l, scale):
 
         if i_a >= 0:
             if mj.actuator_dyntype[i_a] != mujoco.mjtDyn.mjDYN_NONE:
-                gs.logger.warning(f"(MJCF) Actuator internal dynamics not supported")
+                gs.logger.warning("(MJCF) Actuator internal dynamics not supported")
             gaintype = mujoco.mjtGain(mj.actuator_gaintype[i_a])
             if gaintype != mujoco.mjtGain.mjGAIN_FIXED:
                 gs.logger.warning(f"(MJCF) Actuator control gain of type '{gaintype}' not supported")
@@ -423,7 +443,7 @@ def parse_geom(mj, i_g, scale, surface, xml_path):
         else:
             tmesh = trimesh.creation.icosphere(radius=radius)
         gs_type = gs.GEOM_TYPE.SPHERE
-        geom_data = np.array([radius])
+        geom_data = np.array([radius * scale])
 
     elif mj_geom.type == mujoco.mjtGeom.mjGEOM_ELLIPSOID:
         if is_col:
@@ -432,7 +452,7 @@ def parse_geom(mj, i_g, scale, surface, xml_path):
             tmesh = trimesh.creation.icosphere(radius=1.0)
         tmesh.apply_transform(np.diag([*geom_size, 1]))
         gs_type = gs.GEOM_TYPE.ELLIPSOID
-        geom_data = geom_size
+        geom_data = geom_size * scale
 
     elif mj_geom.type == mujoco.mjtGeom.mjGEOM_CAPSULE:
         radius = geom_size[0]
@@ -442,14 +462,14 @@ def parse_geom(mj, i_g, scale, surface, xml_path):
         else:
             tmesh = trimesh.creation.capsule(radius=radius, height=height)
         gs_type = gs.GEOM_TYPE.CAPSULE
-        geom_data = np.array([radius, height])
+        geom_data = np.array([radius * scale, height * scale])
 
     elif mj_geom.type == mujoco.mjtGeom.mjGEOM_CYLINDER:
         radius = geom_size[0]
         height = geom_size[1] * 2
         tmesh = trimesh.creation.cylinder(radius=radius, height=height)
         gs_type = gs.GEOM_TYPE.CYLINDER
-        geom_data = np.array([radius, height])
+        geom_data = np.array([radius * scale, height * scale])
 
     elif mj_geom.type == mujoco.mjtGeom.mjGEOM_BOX:
         tmesh = trimesh.creation.box(extents=geom_size * 2)
@@ -470,7 +490,7 @@ def parse_geom(mj, i_g, scale, surface, xml_path):
                 uv_coordinates = uv_coordinates * mj_mat.texrepeat
                 visual = TextureVisuals(uv=uv_coordinates, image=Image.fromarray(image_array))
                 tmesh.visual = visual
-        geom_data = 2 * geom_size
+        geom_data = 2 * geom_size * scale
 
     elif mj_geom.type == mujoco.mjtGeom.mjGEOM_MESH:
         mj_mesh = mj.mesh(mj_geom.dataid[0])
@@ -659,15 +679,16 @@ def parse_geoms(mj, scale, surface, xml_path):
             "when calling `scene.add_entity`."
         )
 
-    # Parse geometry group if available.
-    # Duplicate collision geometries as visual for bodies not having dedicated visual geometries as a fallback.
+    # Parse geometry group if available
     for link_g_info in links_g_info:
-        has_visual_group = any(g_info["group"] > 0 for g_info in link_g_info)
-        is_all_col = all(g_info["contype"] or g_info["conaffinity"] for g_info in link_g_info)
         for g_info in link_g_info.copy():
-            group = g_info.pop("group")
-            is_col = g_info["contype"] or g_info["conaffinity"]
-            if (has_visual_group and group in (1, 2) and is_col) or (not has_visual_group and is_all_col):
+            # Skip visual geometries
+            if not (g_info["contype"] or g_info["conaffinity"]):
+                continue
+
+            # Duplicate collision geometries as visual in accordance with Mujoco logics:
+            # If groups are defined, only create visual for geoms in visual groups (0, 1 or 2).
+            if g_info["group"] in (0, 1, 2):
                 g_info = g_info.copy()
                 mesh = g_info.pop("mesh")
                 vmesh = gs.Mesh(
@@ -705,7 +726,7 @@ def parse_equalities(mj, scale):
             eq_info["type"] = gs.EQUALITY_TYPE.JOINT
             name_objadr = mj.name_jntadr
         else:
-            raise gs.raise_exception(f"Unsupported MJCF equality type: {mj.eq_type[i_e]}")
+            gs.raise_exception(f"Unsupported MJCF equality type: {mj.eq_type[i_e]}")
 
         objs_name = []
         for obj_idx in (mj.eq_obj1id[i_e], mj.eq_obj2id[i_e]):

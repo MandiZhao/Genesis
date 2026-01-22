@@ -23,7 +23,8 @@ class Liquid(Base):
     mu: float, optional
         The second Lame's parameter. Default is None, computed by E and nu.
     sampler: str, optional
-        Particle sampler ('pbs', 'regular', 'random'). Default is 'pbs'.
+        Particle sampler ('pbs', 'regular', 'random'). Note that 'pbs' is only supported on Linux x86 for now. Defaults
+        to 'pbs' on supported platforms, 'random' otherwise.
     viscous: str, bool
         Whether the liquid is viscous. Simply set mu to zero when non-viscuous. Default is False.
     """
@@ -36,7 +37,7 @@ class Liquid(Base):
         lam=None,
         mu=None,
         viscous=False,
-        sampler="pbs",
+        sampler=None,
     ):
         super().__init__(E, nu, rho, lam, mu, sampler)
 

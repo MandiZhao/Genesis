@@ -244,10 +244,19 @@ def load_meshes(filename):
     """
     meshes = trimesh.load(filename, process=False)
 
-    # If we got a scene, dump the meshes
     if isinstance(meshes, trimesh.Scene):
-        meshes = list(meshes.dump())
-        meshes = [g for g in meshes if isinstance(g, trimesh.Trimesh)]
+        # FIXME: Scene.dump() has bug that uses copy without include_cache=True,
+        #  it will lose the vertex normals.
+        results = []
+        for node_name in meshes.graph.nodes_geometry:
+            transform, geometry_name = meshes.graph[node_name]
+            current = meshes.geometry[geometry_name].copy(include_cache=True)
+            if isinstance(current, trimesh.Trimesh):
+                current.apply_transform(transform)
+                current.metadata["name"] = geometry_name
+                current.metadata["node"] = node_name
+                results.append(current)
+        meshes = results
 
     if isinstance(meshes, (list, tuple, set)):
         meshes = list(meshes)
@@ -285,7 +294,7 @@ def configure_origin(value):
         if value.shape == (6,):
             value = xyz_rpy_to_matrix(value)
         elif value.shape != (4, 4):
-            raise ValueError("Origin must be specified as a 4x4 " "homogenous transformation matrix")
+            raise ValueError("Origin must be specified as a 4x4 homogenous transformation matrix")
     else:
         raise TypeError("Invalid type for origin, expect 4x4 matrix")
     return value

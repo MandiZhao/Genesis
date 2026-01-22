@@ -7,23 +7,15 @@ from genesis.engine.bvh import LBVH, AABB
 from .utils import assert_allclose
 
 
-pytestmark = [
-    pytest.mark.field_only,
-]
-
-
 @pytest.fixture(scope="function")
-def lbvh():
+def lbvh(n_aabbs, n_batches):
     """Fixture for a LBVH tree"""
-
-    n_aabbs = 500
-    n_batches = 10
     aabb = AABB(n_batches=n_batches, n_aabbs=n_aabbs)
-    min = np.random.rand(n_batches, n_aabbs, 3).astype(np.float32) * 20.0
-    max = min + np.random.rand(n_batches, n_aabbs, 3).astype(np.float32)
+    aabbs_min = np.random.rand(n_batches, n_aabbs, 3).astype(gs.np_float) * 20.0
+    aabbs_max = aabbs_min + np.random.rand(n_batches, n_aabbs, 3).astype(gs.np_float)
 
-    aabb.aabbs.min.from_numpy(min)
-    aabb.aabbs.max.from_numpy(max)
+    aabb.aabbs.min.from_numpy(aabbs_min)
+    aabb.aabbs.max.from_numpy(aabbs_max)
 
     lbvh = LBVH(aabb, max_n_query_result_per_aabb=32)
     lbvh.build()
@@ -32,15 +24,16 @@ def lbvh():
 
 
 @pytest.mark.required
+@pytest.mark.parametrize("n_aabbs, n_batches", [(500, 10), (5, 1)])
 def test_morton_code(lbvh):
     morton_codes = lbvh.morton_codes.to_numpy()
 
     # Check that the morton codes are sorted
     for i_b in range(morton_codes.shape[0]):
         for i in range(1, morton_codes.shape[1]):
-            assert (
-                morton_codes[i_b, i, 0] > morton_codes[i_b, i - 1, 0]
-            ), f"Morton codes are not sorted: {morton_codes[i_b, i]} < {morton_codes[i_b, i - 1]}"
+            assert morton_codes[i_b, i, 0] > morton_codes[i_b, i - 1, 0], (
+                f"Morton codes are not sorted: {morton_codes[i_b, i]} < {morton_codes[i_b, i - 1]}"
+            )
 
 
 @pytest.mark.required
@@ -73,12 +66,13 @@ def test_expand_bits():
         str_x = f"{x_np[i]:010b}"
         str_expanded_x = f"{expanded_x_np[i]:030b}"
         # check that the expanded bits are correct
-        assert str_expanded_x == "".join(
-            f"00{bit}" for bit in str_x
-        ), f"Expected {str_expanded_x}, got {''.join(f'00{bit}' for bit in str_x)}"
+        assert str_expanded_x == "".join(f"00{bit}" for bit in str_x), (
+            f"Expected {str_expanded_x}, got {''.join(f'00{bit}' for bit in str_x)}"
+        )
 
 
 @pytest.mark.required
+@pytest.mark.parametrize("n_aabbs, n_batches", [(500, 10), (5, 1)])
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
 def test_build_tree(lbvh):
     nodes = lbvh.nodes.to_numpy()
@@ -97,19 +91,19 @@ def test_build_tree(lbvh):
                 assert parent == -1
 
             else:
-                assert (
-                    nodes["left"][j, parent] == i or nodes["right"][j, parent] == i
-                ), f"Node {i} in batch {j} has incorrect parent: {parent}"
+                assert nodes["left"][j, parent] == i or nodes["right"][j, parent] == i, (
+                    f"Node {i} in batch {j} has incorrect parent: {parent}"
+                )
 
             # Check that left and right children are correct
             if left != -1:
-                assert (
-                    nodes["parent"][j, left] == i
-                ), f"Left child {left} of node {i} in batch {j} has incorrect parent: {nodes['parent'][j, left]}, expected {i}"
+                assert nodes["parent"][j, left] == i, (
+                    f"Left child {left} of node {i} in batch {j} has incorrect parent: {nodes['parent'][j, left]}, expected {i}"
+                )
             if right != -1:
-                assert (
-                    nodes["parent"][j, right] == i
-                ), f"Right child {right} of node {i} in batch {j} has incorrect parent: {nodes['parent'][j, right]}, expected {i}"
+                assert nodes["parent"][j, right] == i, (
+                    f"Right child {right} of node {i} in batch {j} has incorrect parent: {nodes['parent'][j, right]}, expected {i}"
+                )
 
             if left != -1 and right != -1:
                 # Check that the AABBs of the children are within the AABB of the parent
@@ -127,6 +121,7 @@ def test_build_tree(lbvh):
 
 
 @pytest.mark.required
+@pytest.mark.parametrize("n_aabbs, n_batches", [(500, 10), (5, 1)])
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
 def test_query(lbvh):
     import gstaichi as ti
@@ -160,6 +155,6 @@ def test_query(lbvh):
                 if i_a == j_a:
                     assert intersect[i_b, i_a, j_a] == True, f"AABB {i_a} should intersect with itself"
                 else:
-                    assert (
-                        intersect[i_b, i_a, j_a] == intersect[i_b, j_a, i_a]
-                    ), f"AABBs {i_a} and {j_a} should have the same intersection result"
+                    assert intersect[i_b, i_a, j_a] == intersect[i_b, j_a, i_a], (
+                        f"AABBs {i_a} and {j_a} should have the same intersection result"
+                    )

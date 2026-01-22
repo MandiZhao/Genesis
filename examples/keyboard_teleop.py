@@ -13,6 +13,7 @@ space	- Press to close gripper, release to open gripper
 esc	- Quit
 """
 
+import os
 import random
 import threading
 
@@ -32,7 +33,11 @@ class KeyboardDevice:
         self.listener.start()
 
     def stop(self):
-        self.listener.stop()
+        try:
+            self.listener.stop()
+        except NotImplementedError:
+            # Dummy backend does not implement stop
+            pass
         self.listener.join()
 
     def on_press(self, key: keyboard.Key):
@@ -49,7 +54,7 @@ class KeyboardDevice:
 
 def build_scene():
     ########################## init ##########################
-    gs.init(seed=0, precision="32", logging_level="info", backend=gs.cpu)
+    gs.init(precision="32", logging_level="info", backend=gs.cpu)
     np.set_printoptions(precision=7, suppress=True)
 
     ########################## create a scene ##########################
@@ -194,8 +199,9 @@ def run_sim(scene, entities, clients):
         # control arm
         target_quat = target_R.as_quat(scalar_first=True)
         target_entity.set_qpos(np.concatenate([target_pos, target_quat]))
-        q, err = robot.inverse_kinematics(link=ee_link, pos=target_pos, quat=target_quat, return_error=True)
+        q, _err = robot.inverse_kinematics(link=ee_link, pos=target_pos, quat=target_quat, return_error=True)
         robot.control_dofs_position(q[:-2], motors_dof)
+
         # control gripper
         if is_close_gripper:
             robot.control_dofs_force(np.array([-1.0, -1.0]), fingers_dof)
@@ -203,6 +209,9 @@ def run_sim(scene, entities, clients):
             robot.control_dofs_force(np.array([1.0, 1.0]), fingers_dof)
 
         scene.step()
+
+        if "PYTEST_VERSION" in os.environ:
+            break
 
 
 def main():

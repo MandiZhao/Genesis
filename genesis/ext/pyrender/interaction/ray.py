@@ -1,9 +1,11 @@
-from dataclasses import dataclass
 import sys
-
-from genesis.engine.entities.rigid_entity.rigid_geom import RigidGeom
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from .vec3 import Vec3
+
+if TYPE_CHECKING:
+    from genesis.engine.entities.rigid_entity.rigid_geom import RigidGeom
 
 
 EPSILON = 1e-6
@@ -29,7 +31,7 @@ class RayHit:
     distance: float
     position: Vec3
     normal: Vec3
-    geom: RigidGeom | None = None
+    geom: "RigidGeom | None" = None
 
     @property
     def is_hit(self) -> bool:
@@ -37,7 +39,7 @@ class RayHit:
         return self.distance < _MAX_RAY_DISTANCE
 
     @classmethod
-    def no_hit(cls) -> 'RayHit':
+    def no_hit(cls) -> "RayHit":
         return RayHit(_MAX_RAY_DISTANCE, Vec3.zero(), Vec3.zero(), None)
 
 

@@ -2,6 +2,7 @@ logs/
 tmp/
 MUJOCO_LOG.TXT
 imgui.ini
+.polyscope.ini
 .DS_Store
 sftp-config.json
 *.mp4
@@ -149,3 +150,4 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+uv.lock
