@@ -1,21 +1,15 @@
-import math
-from typing import TYPE_CHECKING
-
 import genesis as gs
-from genesis.vis.camera import Camera
-
+import math
 from quadcopter_controller import DronePIDController
-
-if TYPE_CHECKING:
-    from genesis.engine.entities.drone_entity import DroneEntity
-
+from genesis.engine.entities.drone_entity import DroneEntity
+from genesis.vis.camera import Camera
 
 base_rpm = 14468.429183500699
 min_rpm = 0.9 * base_rpm
 max_rpm = 1.5 * base_rpm
 
 
-def hover(drone: "DroneEntity"):
+def hover(drone: DroneEntity):
     drone.set_propellels_rpm([base_rpm, base_rpm, base_rpm, base_rpm])
 
 
@@ -23,7 +17,7 @@ def clamp(rpm):
     return max(min_rpm, min(int(rpm), max_rpm))
 
 
-def fly_to_point(target, controller: "DronePIDController", scene: gs.Scene, cam: Camera):
+def fly_to_point(target, controller: DronePIDController, scene: gs.Scene, cam: Camera):
     drone = controller.drone
     step = 0
     x = target[0] - drone.get_pos()[0]

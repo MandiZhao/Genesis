@@ -79,6 +79,7 @@ class Font(object):
         self._character_map = {}
 
         for i in range(0, 128):
+
             # Generate texture
             face = self._face
             face.load_char(chr(i))
@@ -121,6 +122,7 @@ class Font(object):
         self._font_pt = int(value)
 
     def _add_to_context(self):
+
         self._vao = glGenVertexArrays(1)
         glBindVertexArray(self._vao)
         self._vbo = glGenBuffers(1)

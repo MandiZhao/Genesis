@@ -1,12 +1,7 @@
-from typing import TYPE_CHECKING
-
 import gstaichi as ti
 
 import genesis as gs
 from genesis.repr_base import RBC
-
-if TYPE_CHECKING:
-    from genesis.engine.scene import Scene
 
 
 @ti.data_oriented
@@ -26,7 +21,7 @@ class Entity(RBC):
     ):
         self._uid = gs.UID()
         self._idx = idx
-        self._scene: "Scene" = scene
+        self._scene = scene
         self._solver = solver
         self._material = material
         self._morph = morph

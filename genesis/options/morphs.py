@@ -6,7 +6,7 @@ rigid object / MPM object / FEM object.
 """
 
 import os
-from typing import Any, List, Optional, Sequence, Tuple, Union, Literal
+from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -17,10 +17,11 @@ import genesis.utils.misc as mu
 from .misc import CoacdOptions
 from .options import Options
 
+
 URDF_FORMAT = ".urdf"
 MJCF_FORMAT = ".xml"
+MESH_FORMATS = (".obj", ".ply", ".stl")
 GLTF_FORMATS = (".glb", ".gltf")
-MESH_FORMATS = (".obj", ".stl", *GLTF_FORMATS)
 USD_FORMATS = (".usd", ".usda", ".usdc", ".usdz")
 
 
@@ -75,7 +76,10 @@ class Morph(Options):
         Whether this morph, if created as `RigidEntity`, requires jacobian and inverse kinematics. Defaults to False.
         **This is only used for RigidEntity.**
     is_free : bool, optional
-        This parameter is deprecated.
+        Whether the entity is free to move. Defaults to True. **This is only used for RigidEntity.**
+        This determines whether the entity's geoms have their vertices put into StructFreeVertsState or
+        StructFixedVertsState, and effectively whether they're stored per batch-element, or stored once and shared
+        for the entire batch. That affects correct processing of collision detection.
     """
 
     # Note: pos, euler, quat store only initial varlues at creation time, and are unaffected by sim
@@ -85,11 +89,10 @@ class Morph(Options):
     visualization: bool = True
     collision: bool = True
     requires_jac_and_IK: bool = False
-    is_free: bool | None = None
+    is_free: bool = True
 
     def __init__(self, **data):
         super().__init__(**data)
-
         if self.pos is not None:
             if not isinstance(self.pos, tuple) or len(self.pos) != 3:
                 gs.raise_exception("`pos` should be a 3-tuple.")
@@ -112,9 +115,6 @@ class Morph(Options):
 
         if not self.visualization and not self.collision:
             gs.raise_exception("`visualization` and `collision` cannot both be False.")
-
-        if self.is_free is not None:
-            gs.logger.warning("Morph option 'is_free' has been removed. User-specified value will be ignored.")
 
     def _repr_type(self):
         return f"<gs.morphs.{self.__class__.__name__}>"
@@ -166,10 +166,7 @@ class Primitive(Morph):
         Whether this morph, if created as `RigidEntity`, requires jacobian and inverse kinematics.
         Defaults to False. **This is only used for RigidEntity.**
     fixed : bool, optional
-        Whether the primitive should be fixed. Defaults to False. **This is only used for RigidEntity.**
-    batch_fixed_verts : bool, optional
-        Whether to batch fixed vertices. This will allow setting env-specific poses to fixed geometries, at the cost of
-        significantly increasing memory usage. Default to true. **This is only used for RigidEntity.**
+        Whether the baselink of the entity should be fixed. Defaults to False. **This is only used for RigidEntity.**
     contype : int, optional
         The 32-bit integer bitmasks used for contact filtering of contact pairs. When the contype of one geom and the
         conaffinity of the other geom share a common bit set to 1, two geoms can collide. Defaults to 0xFFFF.
@@ -180,7 +177,6 @@ class Primitive(Morph):
 
     # Rigid specific
     fixed: bool = False
-    batch_fixed_verts: bool = True
     contype: int = 0xFFFF
     conaffinity: int = 0xFFFF
 
@@ -219,10 +215,7 @@ class Box(Primitive, TetGenMixin):
         Whether this morph, if created as `RigidEntity`, requires jacobian and inverse kinematics. Defaults to False.
         **This is only used for RigidEntity.**
     fixed : bool, optional
-        Whether the primitive should be fixed. Defaults to False. **This is only used for RigidEntity.**
-    batch_fixed_verts : bool, optional
-        Whether to batch fixed vertices. This will allow setting env-specific poses to fixed geometries, at the cost of
-        significantly increasing memory usage. Default to true. **This is only used for RigidEntity.**
+        Whether the baselink of the entity should be fixed. Defaults to False. **This is only used for RigidEntity.**
     contype : int, optional
         The 32-bit integer bitmasks used for contact filtering of contact pairs. When the contype of one geom and the
         conaffinity of the other geom share a common bit set to 1, two geoms can collide. Defaults to 0xFFFF.
@@ -304,10 +297,7 @@ class Cylinder(Primitive, TetGenMixin):
         Whether this morph, if created as `RigidEntity`, requires jacobian and inverse kinematics. Defaults to False.
         **This is only used for RigidEntity.**
     fixed : bool, optional
-        Whether the primitive should be fixed. Defaults to False. **This is only used for RigidEntity.**
-    batch_fixed_verts : bool, optional
-        Whether to batch fixed vertices. This will allow setting env-specific poses to fixed geometries, at the cost of
-        significantly increasing memory usage. Default to true. **This is only used for RigidEntity.**
+        Whether the baselink of the entity should be fixed. Defaults to False. **This is only used for RigidEntity.**
     contype : int, optional
         The 32-bit integer bitmasks used for contact filtering of contact pairs. When the contype of one geom and the
         conaffinity of the other geom share a common bit set to 1, two geoms can collide. Defaults to 0xFFFF.
@@ -369,10 +359,7 @@ class Sphere(Primitive, TetGenMixin):
         Whether this morph, if created as `RigidEntity`, requires jacobian and inverse kinematics. Defaults to False.
         **This is only used for RigidEntity.**
     fixed : bool, optional
-        Whether the primitive should be fixed. Defaults to False. **This is only used for RigidEntity.**
-    batch_fixed_verts : bool, optional
-        Whether to batch fixed vertices. This will allow setting env-specific poses to fixed geometries, at the cost of
-        significantly increasing memory usage. Default to true. **This is only used for RigidEntity.**
+        Whether the baselink of the entity should be fixed. Defaults to False. **This is only used for RigidEntity.**
     contype : int, optional
         The 32-bit integer bitmasks used for contact filtering of contact pairs. When the contype of one geom and the
         conaffinity of the other geom share a common bit set to 1, two geoms can collide. Defaults to 0xFFFF.
@@ -435,11 +422,7 @@ class Plane(Primitive):
         Whether the entity needs to be considered for collision checking. Defaults to True.
         `visualization` and `collision` cannot both be False. **This is only used for RigidEntity.**
     fixed : bool, optional
-        Whether the plane is fixed in world. The mass of a plane being ill-defined, this parameter is kept only for
-        consistency but must be True, otherwise it will raise an exception.
-    batch_fixed_verts : bool, optional
-        Whether to batch fixed vertices. This will allow setting env-specific poses to fixed geometries, at the cost of
-        significantly increasing memory usage. Default to false. **This is only used for RigidEntity.**
+        Whether the baselink of the entity should be fixed. Defaults to False. **This is only used for RigidEntity.**
     contype : int, optional
         The 32-bit integer bitmasks used for contact filtering of contact pairs. When the contype of one geom and the
         conaffinity of the other geom share a common bit set to 1, two geoms can collide. Defaults to 0xFFFF.
@@ -452,8 +435,7 @@ class Plane(Primitive):
         The size of each texture tile. Defaults to (1, 1).
     """
 
-    fixed: Literal[True] = True
-    batch_fixed_verts: bool = False
+    fixed: bool = True
     normal: tuple = (0, 0, 1)
     plane_size: tuple = (1e3, 1e3)
     tile_size: tuple = (1, 1)
@@ -522,13 +504,6 @@ class FileMorph(Morph):
         0.0 to enforce decomposition, float("inf") to disable it completely. Defaults to float("inf").
     coacd_options : CoacdOptions, optional
         Options for configuring coacd convex decomposition. Needs to be a `gs.options.CoacdOptions` object.
-    recompute_inertia : bool, optional
-        Force recomputing spatial inertia of links from their geometry. This option is useful to import partially
-        broken assets from external providers that cannot be re-exported from source. Default to False.
-    file_meshes_are_zup : bool, optional
-        Defines if the mesh files are expressed in a Z-up or Y-up coordinate system. If set to true, meshes are loaded
-        as Z-up and no transforms are applied to the input data. If set to false, all meshes undergo a conversion step
-        where the original coordinates are transformed as follows: (X, Y, Z) → (X, -Z, Y). Defaults to True.
     visualization : bool, optional
         Whether the entity needs to be visualized. Set it to False if you need a invisible object only for collision
         purposes. Defaults to True. `visualization` and `collision` cannot both be False.
@@ -536,9 +511,6 @@ class FileMorph(Morph):
     collision : bool, optional
         Whether the entity needs to be considered for collision checking. Defaults to True.
         `visualization` and `collision` cannot both be False. **This is only used for RigidEntity.**
-    batch_fixed_verts : bool, optional
-        Whether to batch fixed vertices. This will allow setting env-specific poses to fixed geometries, at the cost of
-        significantly increasing memory usage. Default to true. **This is only used for RigidEntity.**
     requires_jac_and_IK : bool, optional
         Whether this morph, if created as `RigidEntity`, requires jacobian and inverse kinematics. Defaults to False.
         **This is only used for RigidEntity.**
@@ -555,12 +527,9 @@ class FileMorph(Morph):
     decompose_robot_error_threshold: float = float("inf")
     coacd_options: Optional[CoacdOptions] = None
     recompute_inertia: bool = False
-    parse_glb_with_zup: Optional[bool] = None
-    file_meshes_are_zup: bool | None = True
-    batch_fixed_verts: bool = False
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, **data):
+        super().__init__(**data)
 
         if self.decompose_nonconvex is not None:
             if self.decompose_nonconvex:
@@ -574,13 +543,6 @@ class FileMorph(Morph):
             gs.logger.warning(
                 "FileMorph option 'decompose_nonconvex' is deprecated and will be removed in future release. Please use "
                 "'convexify' and 'decompose_(robot|object)_error_threshold' instead."
-            )
-
-        if self.parse_glb_with_zup is not None:
-            self.file_meshes_are_zup = not self.parse_glb_with_zup
-            gs.logger.warning(
-                "FileMorph option 'parse_glb_with_zup' is deprecated and will be removed in future release. Please use "
-                "'file_meshes_are_zup'instead."
             )
 
         # Make sure that this threshold is positive to avoid decomposition of convex and primitive shapes
@@ -667,9 +629,6 @@ class Mesh(FileMorph, TetGenMixin):
         0.0 to enforce decomposition, float("inf") to disable it completely. Defaults to float("inf").
     coacd_options : CoacdOptions, optional
         Options for configuring coacd convex decomposition. Needs to be a `gs.options.CoacdOptions` object.
-    recompute_inertia : bool, optional
-        Force recomputing spatial inertia of links from their geometry. This option is useful to import partially
-        broken assets from external providers that cannot be re-exported from source. Default to False.
     merge_submeshes_for_collision : bool, optional
         Whether to merge submeshes for collision. Defaults to True. **This is only used for RigidEntity.**
     visualization : bool, optional
@@ -682,20 +641,10 @@ class Mesh(FileMorph, TetGenMixin):
     requires_jac_and_IK : bool, optional
         Whether this morph, if created as `RigidEntity`, requires jacobian and inverse kinematics. Defaults to False.
         **This is only used for RigidEntity.**
-    parse_glb_with_zup : bool, optional
-        This parameter is deprecated, see file_meshes_are_zup.
-    file_meshes_are_zup : bool, optional
-        Defines if the mesh files are expressed in a Z-up or Y-up coordinate system. If set to true, meshes are loaded
-        as Z-up and no transforms are applied to the input data. If set to false, all meshes undergo a conversion step
-        where the original coordinates are transformed as follows: (X, Y, Z) → (X, -Z, Y). If None, then it will default
-        to True for all mesh formats except GLTF/GLB, as they are defined as Y-up by the standard. Beware that setting
-        this option to True for GLTF/GLB is not supported and will rather apply a rotation on the morph. Default to
-        None.
+    parse_glb_with_trimesh : bool, optional
+        Whether to use trimesh to load glb files. Defaults to False, in which case pygltflib will be used.
     fixed : bool, optional
-        Whether the object should be fixed. Defaults to False. **This is only used for RigidEntity.**
-    batch_fixed_verts : bool, optional
-        Whether to batch fixed vertices. This will allow setting env-specific poses to fixed geometries, at the cost of
-        significantly increasing memory usage. Default to false. **This is only used for RigidEntity.**
+        Whether the baselink of the entity should be fixed. Defaults to False. **This is only used for RigidEntity.**
     contype : int, optional
         The 32-bit integer bitmasks used for contact filtering of contact pairs. When the contype of one geom and the
         conaffinity of the other geom share a common bit set to 1, two geoms can collide. Defaults to 0xFFFF.
@@ -730,33 +679,14 @@ class Mesh(FileMorph, TetGenMixin):
         **This is only used for Volumetric Entity that requires tetraheralization.**
     """
 
+    parse_glb_with_trimesh: bool = False
+
     # Rigid specific
-    file_meshes_are_zup: bool | None = None
     fixed: bool = False
     contype: int = 0xFFFF
     conaffinity: int = 0xFFFF
     group_by_material: bool = True
     merge_submeshes_for_collision: bool = True
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-        if self.is_format(gs.options.morphs.GLTF_FORMATS):
-            if self.file_meshes_are_zup:
-                gs.logger.warning(
-                    "Specifying 'file_meshes_are_zup' for GLTF/GLB files is not supported. A rotation will be applied "
-                    "explicitly on the morph instead. Please consider fixing your asset to use Y-UP convention."
-                )
-                quat = (0.707, -0.707, 0.0, 0.0)
-                if self.quat is None:
-                    self.quat = quat
-                else:
-                    self.quat = gu.transform_quat_by_quat(
-                        np.array(quat, dtype=gs.np_float), np.array(self.quat, dtype=gs.np_float)
-                    )
-            self.file_meshes_are_zup = False
-        elif self.file_meshes_are_zup is None:
-            self.file_meshes_are_zup = True
 
 
 class MeshSet(Mesh):
@@ -839,15 +769,6 @@ class MJCF(FileMorph):
         0.0 to enforce decomposition, float("inf") to disable it completely. Defaults to float("inf").
     coacd_options : CoacdOptions, optional
         Options for configuring coacd convex decomposition. Needs to be a `gs.options.CoacdOptions` object.
-    recompute_inertia : bool, optional
-        Force recomputing spatial inertia of links from their geometry. This option is useful to import partially
-        broken assets from external providers that cannot be re-exported from source. Default to False.
-    parse_glb_with_zup : bool, optional
-        This parameter is deprecated, see file_meshes_are_zup.
-    file_meshes_are_zup : bool, optional
-        Defines if the mesh files are expressed in a Z-up or Y-up coordinate system. If set to true, meshes are loaded
-        as Z-up and no transforms are applied to the input data. If set to false, all meshes undergo a conversion step
-        where the original coordinates are transformed as follows: (X, Y, Z) → (X, -Z, Y). Defaults to True.
     visualization : bool, optional
         Whether the entity needs to be visualized. Set it to False if you need a invisible object only for collision
         purposes. Defaults to True. `visualization` and `collision` cannot both be False.
@@ -856,9 +777,6 @@ class MJCF(FileMorph):
         `visualization` and `collision` cannot both be False.
     requires_jac_and_IK : bool, optional
         Whether this morph, if created as `RigidEntity`, requires jacobian and inverse kinematics. Defaults to True.
-    batch_fixed_verts : bool, optional
-        Whether to batch fixed vertices. This will allow setting env-specific poses to fixed geometries, at the cost of
-        significantly increasing memory usage. Default to true. **This is only used for RigidEntity.**
     default_armature : float, optional
         Default rotor inertia of the actuators. In practice it is applied to all joints regardless of whether they are
         actuated. None to disable. Default to 0.1.
@@ -952,15 +870,6 @@ class URDF(FileMorph):
         0.0 to enforce decomposition, float("inf") to disable it completely. Defaults to float("inf").
     coacd_options : CoacdOptions, optional
         Options for configuring coacd convex decomposition. Needs to be a `gs.options.CoacdOptions` object.
-    recompute_inertia : bool, optional
-        Force recomputing spatial inertia of links from their geometry. This option is useful to import partially
-        broken assets from external providers that cannot be re-exported from source. Default to False.
-    parse_glb_with_zup : bool, optional
-        This parameter is deprecated, see file_meshes_are_zup.
-    file_meshes_are_zup : bool, optional
-        Defines if the mesh files are expressed in a Z-up or Y-up coordinate system. If set to true, meshes are loaded
-        as Z-up and no transforms are applied to the input data. If set to false, all meshes undergo a conversion step
-        where the original coordinates are transformed as follows: (X, Y, Z) → (X, -Z, Y). Defaults to True.
     visualization : bool, optional
         Whether the entity needs to be visualized. Set it to False if you need a invisible object only for collision
         purposes. Defaults to True. `visualization` and `collision` cannot both be False.
@@ -971,9 +880,6 @@ class URDF(FileMorph):
         Whether this morph, if created as `RigidEntity`, requires jacobian and inverse kinematics. Defaults to True.
     fixed : bool, optional
         Whether the baselink of the entity should be fixed. Defaults to False.
-    batch_fixed_verts : bool, optional
-        Whether to batch fixed vertices. This will allow setting env-specific poses to fixed geometries, at the cost of
-        significantly increasing memory usage. Default to true. **This is only used for RigidEntity.**
     prioritize_urdf_material : bool, optional
         Sometimes a geom in a urdf file will be assigned a color, and the geom asset file also contains its own visual
         material. This parameter controls whether to prioritize the URDF-defined material over the asset's own material.
@@ -1057,15 +963,6 @@ class Drone(FileMorph):
         0.0 to enforce decomposition, float("inf") to disable it completely. Defaults to float("inf").
     coacd_options : CoacdOptions, optional
         Options for configuring coacd convex decomposition. Needs to be a `gs.options.CoacdOptions` object.
-    recompute_inertia : bool, optional
-        Force recomputing spatial inertia of links from their geometry. This option is useful to import partially
-        broken assets from external providers that cannot be re-exported from source. Default to False.
-    parse_glb_with_zup : bool, optional
-        This parameter is deprecated, see file_meshes_are_zup.
-    file_meshes_are_zup : bool, optional
-        Defines if the mesh files are expressed in a Z-up or Y-up coordinate system. If set to true, meshes are loaded
-        as Z-up and no transforms are applied to the input data. If set to false, all meshes undergo a conversion step
-        where the original coordinates are transformed as follows: (X, Y, Z) → (X, -Z, Y). Defaults to True.
     visualization : bool, optional
         Whether the entity needs to be visualized. Set it to False if you need a invisible object only for collision
         purposes. Defaults to True. `visualization` and `collision` cannot both be False.
@@ -1197,19 +1094,14 @@ class Terrain(Morph):
         The height field to generate the terrain. If specified, all other configurations will be ignored.
         Defaults to None.
     name : str, optional
-        The name of the terrain. If specified, the terrain will only be generated once for a given set of options and
-        later loaded from cache, instead of being re-generated systematically when building the scene. This holds true
-        no matter if `randomize` is True.
+        The name of the terrain to save
     from_stored : str, optional
-        This parameter is deprecated.
+        The path of the stored terrain to load
     subterrain_parameters : dictionary, optional
         Lets users pick their own subterrain parameters.
-    batch_fixed_verts : bool, optional
-        Whether to batch fixed vertices. This will allow setting env-specific poses to fixed geometries, at the cost of
-        significantly increasing memory usage. Default to false. **This is only used for RigidEntity.**
     """
 
-    batch_fixed_verts: bool = False
+    is_free: bool = False
     randomize: bool = False  # whether to randomize the terrain
     n_subterrains: Tuple[int, int] = (3, 3)  # number of subterrains in x and y directions
     subterrain_size: Tuple[float, float] = (12.0, 12.0)  # meter
@@ -1222,7 +1114,7 @@ class Terrain(Morph):
         ["random_uniform_terrain", "pyramid_stairs_terrain", "sloped_terrain"],
     ]
     height_field: Any = None
-    name: str | None = None
+    name: str = "default"  # name to store and reuse the terrain
     from_stored: Any = None
     subterrain_parameters: dict[str, dict] | None = None
 
@@ -1258,7 +1150,7 @@ class Terrain(Morph):
             try:
                 if np.array(self.height_field).ndim != 2:
                     gs.raise_exception("`height_field` should be a 2D array.")
-            except Exception:
+            except:
                 gs.raise_exception("`height_field` should be array-like to be converted to np.ndarray.")
 
             return
@@ -1288,14 +1180,6 @@ class Terrain(Morph):
             self.subterrain_size[1], self.horizontal_scale
         ):
             gs.raise_exception("`subterrain_size` should be divisible by `horizontal_scale`.")
-
-        if self.from_stored is not None:
-            if self.name is None:
-                self.name = self.from_stored
-            else:
-                if self.from_stored != self.name:
-                    gs.raise_exception("Terrain option 'from_stored' is deprecated and inconsistent with 'name'.")
-            gs.logger.warning("Terrain option 'from_stored' is deprecated. Please use 'name' instead.")
 
     @property
     def default_params(self):
@@ -1346,163 +1230,3 @@ class Terrain(Morph):
     @property
     def subterrain_params(self):
         return self._subterrain_parameters
-
-
-class USD(FileMorph):
-    """
-    Configuration class for USD file loading with advanced processing options.
-
-    This class encapsulates the file path and processing parameters for USD loading,
-    allowing users to control convexification, decimation, and decomposition behavior
-    when loading USD scenes via add_stage().
-
-    Parameters
-    ----------
-    file : str
-        The path to the USD file.
-
-    Joint Dynamics Options
-    ----------------------
-    joint_friction_attr_candidates : List[str], optional
-        List of candidate attribute names for joint friction. The parser will try these in order.
-        If no matching attribute is found, Genesis default (0.0) is used.
-        Defaults to ["physxJoint:jointFriction", "physics:jointFriction", "jointFriction", "friction"].
-    joint_armature_attr_candidates : List[str], optional
-        List of candidate attribute names for joint armature. The parser will try these in order.
-        If no matching attribute is found, Genesis default (0.0) is used.
-        Defaults to ["physxJoint:armature", "physics:armature", "armature"].
-    revolute_joint_stiffness_attr_candidates : List[str], optional
-        List of candidate attribute names for revolute joint stiffness. The parser will try these in order.
-        If no matching attribute is found, Genesis default (0.0) is used.
-        Defaults to ["physxLimit:angular:stiffness", "physics:stiffness", "stiffness"].
-    revolute_joint_damping_attr_candidates : List[str], optional
-        List of candidate attribute names for revolute joint damping. The parser will try these in order.
-        If no matching attribute is found, Genesis default (0.0) is used.
-        Defaults to ["physxLimit:angular:damping", "physics:angular:damping", "angular:damping"].
-    prismatic_joint_stiffness_attr_candidates : List[str], optional
-        List of candidate attribute names for prismatic joint stiffness. The parser will try these in order.
-        If no matching attribute is found, Genesis default (0.0) is used.
-        Defaults to ["physxLimit:linear:stiffness", "physxLimit:X:stiffness", "physxLimit:Y:stiffness", "physxLimit:Z:stiffness",
-        "physics:linear:stiffness", "linear:stiffness"].
-    prismatic_joint_damping_attr_candidates : List[str], optional
-        List of candidate attribute names for prismatic joint damping. The parser will try these in order.
-        If no matching attribute is found, Genesis default (0.0) is used.
-        Defaults to ["physxLimit:linear:damping", "physxLimit:X:damping", "physxLimit:Y:damping", "physxLimit:Z:damping",
-        "physics:linear:damping", "linear:damping"].
-
-    Geometry Parsing Options
-    -------------------------
-    collision_mesh_prim_patterns : List[str], optional
-        List of regex patterns to match collision mesh prim names. Patterns are tried in order.
-        Defaults to [r"^([cC]ollision).*", r"^.*"].
-    visual_mesh_prim_patterns : List[str], optional
-        List of regex patterns to match visual mesh prim names. Patterns are tried in order.
-        Defaults to [r"^([vV]isual).*", r"^.*"].
-
-    Geometry Decomposition Options
-    -------------------------------
-    convexify : bool, optional
-        Whether to convexify the entity. When convexify is True, all the meshes in the entity will each be converted
-        to a set of convex hulls. The mesh will be decomposed into multiple convex components if the convex hull is not
-        sufficient to meet the desired accuracy. The module 'coacd' is used for this decomposition process.
-        If not given, it defaults to `True` for `RigidEntity` and `False` for other deformable entities.
-    decompose_object_error_threshold : float, optional
-        For basic rigid objects (mug, table...), skip convex decomposition if the relative difference between the
-        volume of original mesh and its convex hull is lower than this threshold.
-        0.0 to enforce decomposition, float("inf") to disable it completely. Defaults to 0.15 (15%).
-    decompose_robot_error_threshold : float, optional
-        For poly-articulated robots, skip convex decomposition if the relative difference between the volume of
-        original mesh and its convex hull is lower than this threshold.
-        0.0 to enforce decomposition, float("inf") to disable it completely. Defaults to float("inf").
-    coacd_options : CoacdOptions, optional
-        Options for configuring coacd convex decomposition. Needs to be a `gs.options.CoacdOptions` object.
-    recompute_inertia : bool, optional
-        Force recomputing spatial inertia of links from their geometry. This option is useful to import partially
-        broken assets from external providers that cannot be re-exported from source. Default to False.
-    decimate : bool, optional
-        Whether to decimate (simplify) the mesh. Defaults to True. **This is only used for RigidEntity.**
-    decimate_face_num : int, optional
-        The number of faces to decimate to. Defaults to 500. **This is only used for RigidEntity.**
-    decimate_aggressiveness : int, optional
-        How hard the decimation process will try to match the target number of faces, as an integer ranging from 0 to 8.
-        0 is lossless. 2 preserves all features of the original geometry. 5 may significantly alter the original
-        geometry if necessary. 8 does what needs to be done at all costs. Defaults to 2.
-        **This is only used for RigidEntity.**
-
-    Internal Options
-    ----------------
-    prim_path : str, optional
-        The parsing target prim path. Defaults to None.
-    parser_ctx : Any, optional
-        The parser context. Defaults to None.
-    """
-
-    file: str
-
-    # Joint Dynamics Options
-    joint_friction_attr_candidates: List[str] = [
-        "physxJoint:jointFriction",  # Isaac-Sim assets compatibility
-        "physics:jointFriction",  # unoffical USD attribute, some assets may adapt to this attribute
-        "jointFriction",  # unoffical USD attribute, some assets may adapt to this attribute
-        "friction",  # unoffical USD attribute, some assets may adapt to this attribute
-    ]
-    joint_armature_attr_candidates: List[str] = [
-        "physxJoint:armature",  # Isaac-Sim assets compatibility
-        "physics:armature",  # unoffical USD attribute, some assets may adapt to this attribute
-        "armature",  # unoffical USD attribute, some assets may adapt to this attribute
-    ]
-    revolute_joint_stiffness_attr_candidates: List[str] = [
-        "physxLimit:angular:stiffness",  # Isaac-Sim assets compatibility
-        "physics:stiffness",  # unoffical USD attribute, some assets may adapt to this attribute
-        "stiffness",  # unoffical USD attribute, some assets may adapt to this attribute
-    ]
-    revolute_joint_damping_attr_candidates: List[str] = [
-        "physxLimit:angular:damping",  # Isaac-Sim assets compatibility
-        "physics:angular:damping",  # unoffical USD attribute, some assets may adapt to this attribute
-        "angular:damping",  # unoffical USD attribute, some assets may adapt to this attribute
-    ]
-    prismatic_joint_stiffness_attr_candidates: List[str] = [
-        "physxLimit:linear:stiffness",  # Isaac-Sim assets compatibility
-        "physxLimit:X:stiffness",  # Isaac-Sim assets compatibility
-        "physxLimit:Y:stiffness",  # Isaac-Sim assets compatibility
-        "physxLimit:Z:stiffness",  # Isaac-Sim assets compatibility
-        "physics:linear:stiffness",  # unoffical USD attribute, some assets may adapt to this attribute
-        "linear:stiffness",  # unoffical USD attribute, some assets may adapt to this attribute
-    ]
-    prismatic_joint_damping_attr_candidates: List[str] = [
-        "physxLimit:linear:damping",  # Isaac-Sim assets compatibility
-        "physxLimit:X:damping",  # Isaac-Sim assets compatibility
-        "physxLimit:Y:damping",  # Isaac-Sim assets compatibility
-        "physxLimit:Z:damping",  # Isaac-Sim assets compatibility
-        "physics:linear:damping",  # unoffical USD attribute, some assets may adapt to this attribute
-        "linear:damping",  # unoffical USD attribute, some assets may adapt to this attribute
-    ]
-
-    # Geometry Parsing Options
-    collision_mesh_prim_patterns: List[str] = [r"^([cC]ollision).*", r"^.*"]
-    visual_mesh_prim_patterns: List[str] = [r"^([vV]isual).*", r"^.*"]
-
-    # Geometry Decomposition Options
-    convexify: Optional[bool] = None
-    decompose_object_error_threshold: float = 0.15
-    decompose_robot_error_threshold: float = float("inf")
-    coacd_options: Optional[CoacdOptions] = None
-    decimate: bool = True
-    decimate_face_num: int = 500
-    decimate_aggressiveness: int = 2
-
-    # Internal Options
-    prim_path: Optional[str] = None
-    parser_ctx: Any = None
-
-    def __init__(self, **data):
-        super().__init__(**data)
-
-        if not isinstance(self.file, str):
-            gs.raise_exception("`file` should be a string.")
-
-        if not self.file.lower().endswith(USD_FORMATS):
-            gs.raise_exception(f"USDMorph requires a USD file with extension {USD_FORMATS}, got: {self.file}")
-
-        if self.coacd_options is None:
-            self.coacd_options = CoacdOptions()

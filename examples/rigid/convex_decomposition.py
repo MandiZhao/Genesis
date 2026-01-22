@@ -1,5 +1,4 @@
 import argparse
-import os
 
 from huggingface_hub import snapshot_download
 
@@ -38,11 +37,7 @@ def main():
     )
     for i, asset_name in enumerate(("donut_0", "mug_1", "cup_2", "apple_15")):
         asset_path = snapshot_download(
-            repo_type="dataset",
-            repo_id="Genesis-Intelligence/assets",
-            revision="4d96c3512df4421d4dd3d626055d0d1ebdfdd7cc",
-            allow_patterns=f"{asset_name}/*",
-            max_workers=1,
+            repo_type="dataset", repo_id="Genesis-Intelligence/assets", allow_patterns=f"{asset_name}/*"
         )
         scene.add_entity(
             gs.morphs.MJCF(
@@ -55,8 +50,7 @@ def main():
 
     ########################## build ##########################
     scene.build()
-    horizon = 2000 if "PYTEST_VERSION" not in os.environ else 5
-    for i in range(horizon):
+    for i in range(2000):
         scene.step()
 
 

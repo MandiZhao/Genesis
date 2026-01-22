@@ -1,3 +1,4 @@
+import numpy as np
 import gstaichi as ti
 
 from ..base import Material

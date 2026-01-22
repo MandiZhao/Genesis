@@ -1,4 +1,3 @@
-import os
 import time
 import threading
 
@@ -105,9 +104,6 @@ def run_sim(scene, drone, controller):
         # Limit simulation rate
         time.sleep(1.0 / scene.viewer.max_FPS)
 
-        if "PYTEST_VERSION" in os.environ:
-            break
-
 
 def main():
     # Initialize Genesis
@@ -132,7 +128,7 @@ def main():
     )
 
     # Add entities
-    scene.add_entity(gs.morphs.Plane())
+    plane = scene.add_entity(gs.morphs.Plane())
     drone = scene.add_entity(
         morph=gs.morphs.Drone(
             file="urdf/drones/cf2x.urdf",
@@ -166,14 +162,9 @@ def main():
 
     # Run simulation in another thread
     threading.Thread(target=run_sim, args=(scene, drone, controller)).start()
-    if "PYTEST_VERSION" not in os.environ:
-        scene.viewer.run()
+    scene.viewer.run()
 
-    try:
-        listener.stop()
-    except NotImplementedError:
-        # Dummy backend does not implement stop
-        pass
+    listener.stop()
 
 
 if __name__ == "__main__":

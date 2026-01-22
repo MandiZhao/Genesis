@@ -1,16 +1,44 @@
 import queue
 import threading
-import time
-from typing import TYPE_CHECKING, Callable, Generic, TypeVar
+from typing import Callable, Generic, TypeVar
 
 import genesis as gs
-from genesis.options.recorders import RecorderOptions
+from genesis.options import Options
 
-if TYPE_CHECKING:
-    from .recorder_manager import RecorderManager
-
+from .recorder_manager import RecorderManager
 
 T = TypeVar("T")
+
+
+class RecorderOptions(Options):
+    """
+    Options for recording simulation data by automatically sampling data from a data source, e.g. a sensor.
+
+    Parameters
+    ----------
+    hz: float, optional
+        The frequency at which to sample data, in Hz (samples per second).
+        If None, the data will be sampled every step.
+    buffer_size: int, optional
+        Applicable when run_in_thread is True. The size of the data queue buffer.
+        Defaults to 0, which means infinite size.
+    buffer_full_wait_time: float, optional
+        Applicable when run_in_thread is True. The time to wait for buffer space to become available when the
+        buffer is full. Defaults to 0.1 seconds.
+    """
+
+    hz: float | None = None
+    buffer_size: int = 0
+    buffer_full_wait_time: float = 0.1
+
+    def validate(self):
+        """Validate the recorder options values before the recorder is added to the scene."""
+        if self.hz is not None and self.hz < gs.EPS:
+            gs.raise_exception(f"[{type(self).__name__}] recording hz should be greater than 0.")
+        if self.buffer_size < 0:
+            gs.raise_exception(f"[{type(self).__name__}] buffer size should be 0 (infinite size) or greater.")
+        if self.buffer_full_wait_time < gs.EPS:
+            gs.raise_exception(f"[{type(self).__name__}] buffer full wait time should be greater than 0.")
 
 
 class Recorder(Generic[T]):
@@ -21,7 +49,7 @@ class Recorder(Generic[T]):
     done through the RecorderManager.
     """
 
-    def __init__(self, manager: "RecorderManager", options: RecorderOptions, data_func: Callable[[], T]):
+    def __init__(self, manager: RecorderManager, options: RecorderOptions, data_func: Callable[[], T]):
         self._options = options
         self._manager = manager
         self._data_func = data_func
@@ -86,9 +114,7 @@ class Recorder(Generic[T]):
         envs_idx: array_like, optional
             The indices of the environments to reset. If None, all environments are reset.
         """
-        if self.run_in_thread:
-            # sync the thread to ensure all data is processed
-            self.sync()
+        raise NotImplementedError(f"[{type(self).__name__}] reset() is not implemented.")
 
     @property
     def run_in_thread(self) -> bool:
@@ -122,60 +148,25 @@ class Recorder(Generic[T]):
         self._is_recording = True
 
         if self.run_in_thread:
-            self.start_thread()
+            self._data_queue = queue.Queue(maxsize=self._options.buffer_size)
+            self._processor_thread = threading.Thread(target=self._process_data_loop)
+            self._processor_thread.start()
 
     @gs.assert_built
     def stop(self):
         """Stop the recording thread and cleanup resources."""
         if self._is_recording:
             self._is_recording = False
-            if self.run_in_thread:
-                self.join_thread()
+            self.sync()
             self.cleanup()
 
     @gs.assert_built
-    def join_thread(self):
+    def sync(self):
         """Wait for the processor thread to finish."""
-        if self._processor_thread is not None:
+        if self.run_in_thread and self._processor_thread is not None:
             self._processor_thread.join()
             self._processor_thread = None
             self._data_queue = None
-        else:
-            gs.logger.warning(f"[{type(self).__name__}] join_thread(): No processor thread to join.")
-
-    @gs.assert_built
-    def start_thread(self):
-        """Wait for the processor thread to finish."""
-        if self._processor_thread is None:
-            self._data_queue = queue.Queue(maxsize=self._options.buffer_size)
-            self._processor_thread = threading.Thread(target=self._process_data_loop)
-            self._processor_thread.start()
-        else:
-            gs.logger.warning(f"[{type(self).__name__}] start_thread(): Processor thread already exists.")
-
-    @gs.assert_built
-    def sync(self, timeout: float | None = None):
-        """
-        Wait until the data queue is empty.
-
-        Parameters
-        ----------
-        timeout: float | None
-            The maximum time to wait for the data queue to be empty. If None, wait indefinitely.
-            If the timeout is reached, an exception is raised.
-        """
-        timestep = min(0.1, timeout) if timeout is not None else 0.1
-        if self._data_queue is not None:
-            if timeout is not None:
-                start_time = time.time()
-
-            while not self._data_queue.empty():
-                if timeout is not None and time.time() - start_time > timeout:
-                    gs.raise_exception(f"[{type(self).__name__}] sync(): Timeout waiting for data queue to be empty.")
-
-                dt = min(timestep, (start_time + timeout) - time.time()) if timeout is not None else timestep
-                if dt > 0.0:
-                    time.sleep(dt)
 
     @gs.assert_built
     def step(self, global_step: int):

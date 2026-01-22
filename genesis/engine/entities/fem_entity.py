@@ -1,5 +1,3 @@
-from functools import wraps
-
 import igl
 import numpy as np
 import gstaichi as ti
@@ -13,19 +11,9 @@ from genesis.engine.entities.rigid_entity import RigidLink
 from genesis.engine.couplers import SAPCoupler
 from genesis.engine.states.cache import QueriedStates
 from genesis.engine.states.entities import FEMEntityState
-from genesis.utils.misc import to_gs_tensor, tensor_to_array, broadcast_tensor
+from genesis.utils.misc import ALLOCATE_TENSOR_WARNING, to_gs_tensor, tensor_to_array
 
 from .base_entity import Entity
-
-
-def assert_muscle(method):
-    @wraps(method)
-    def wrapper(self, *args, **kwargs):
-        if not isinstance(self.material, gs.materials.FEM.Muscle):
-            gs.raise_exception("This method is only supported by entities with 'FEM.Muscle' material.")
-        return method(self, *args, **kwargs)
-
-    return wrapper
 
 
 @ti.data_oriented
@@ -71,46 +59,29 @@ class FEMEntity(Entity):
 
         self.sample()
 
-        # Check if this is cloth (elements are already triangles)
-        from genesis.engine.materials.FEM.cloth import Cloth as ClothMaterial
+        el2tri = np.array(
+            [  # follow the order with correct normal
+                [[v[0], v[2], v[1]], [v[1], v[2], v[3]], [v[0], v[1], v[3]], [v[0], v[3], v[2]]] for v in self.elems
+            ],
+            dtype=gs.np_int,
+        )
+        all_tri = el2tri.reshape((-1, 3))
+        all_tri_sorted = np.sort(all_tri, axis=1)
+        _, unique_idcs, cnt = np.unique(all_tri_sorted, axis=0, return_counts=True, return_index=True)
+        unique_tri = all_tri[unique_idcs]
+        surface_tri = unique_tri[cnt == 1]
 
-        is_cloth = isinstance(self.material, ClothMaterial)
+        self._surface_tri_np = surface_tri
+        self._n_surfaces = len(self._surface_tri_np)
 
-        if is_cloth:
-            # For cloth, elements are already surface triangles
-            self._surface_tri_np = self.elems
-            self._n_surfaces = len(self._surface_tri_np)
-            if self._n_surfaces > 0:
-                self._n_surface_vertices = len(np.unique(self._surface_tri_np))
-            else:
-                self._n_surface_vertices = 0
-            # For cloth, each triangle is its own "element"
-            self._surface_el_np = np.arange(self.elems.shape[0], dtype=gs.np_int)
+        if self._n_surfaces > 0:
+            self._n_surface_vertices = len(np.unique(self._surface_tri_np))
         else:
-            # For volumetric FEM, extract surface triangles from tetrahedral elements
-            el2tri = np.array(
-                [  # follow the order with correct normal
-                    [[v[0], v[2], v[1]], [v[1], v[2], v[3]], [v[0], v[1], v[3]], [v[0], v[3], v[2]]] for v in self.elems
-                ],
-                dtype=gs.np_int,
-            )
-            all_tri = el2tri.reshape((-1, 3))
-            all_tri_sorted = np.sort(all_tri, axis=1)
-            _, unique_idcs, cnt = np.unique(all_tri_sorted, axis=0, return_counts=True, return_index=True)
-            unique_tri = all_tri[unique_idcs]
-            surface_tri = unique_tri[cnt == 1]
+            self._n_surface_vertices = 0
 
-            self._surface_tri_np = surface_tri
-            self._n_surfaces = len(self._surface_tri_np)
-
-            if self._n_surfaces > 0:
-                self._n_surface_vertices = len(np.unique(self._surface_tri_np))
-            else:
-                self._n_surface_vertices = 0
-
-            tri2el = np.repeat(np.arange(self.elems.shape[0], dtype=gs.np_int)[:, np.newaxis], 4, axis=1)
-            unique_el = tri2el.flat[unique_idcs]
-            self._surface_el_np = unique_el[cnt == 1]
+        tri2el = np.repeat(np.arange(self.elems.shape[0], dtype=gs.np_int)[:, np.newaxis], 4, axis=1)
+        unique_el = tri2el.flat[unique_idcs]
+        self._surface_el_np = unique_el[cnt == 1]
 
         if isinstance(self.sim.coupler, SAPCoupler):
             self.compute_pressure_field()
@@ -125,36 +96,6 @@ class FEMEntity(Entity):
     # ------------------------------------------------------------------------------------
     # ----------------------------------- basic entity ops -------------------------------
     # ------------------------------------------------------------------------------------
-
-    def _sanitize_verts_idx_local(self, verts_idx_local=None, envs_idx=None):
-        if verts_idx_local is None:
-            verts_idx_local = range(self.n_vertices)
-
-        if envs_idx is None:
-            verts_idx_local_ = broadcast_tensor(verts_idx_local, gs.tc_int, (-1,), ("verts_idx",))
-        else:
-            verts_idx_local_ = broadcast_tensor(
-                verts_idx_local, gs.tc_int, (len(envs_idx), -1), ("envs_idx", "verts_idx")
-            )
-
-        # FIXME: This check is too expensive
-        # if not (0 <= verts_idx_local_ & verts_idx_local_ < self.n_vertices).all():
-        #     gs.raise_exception("Elements of `verts_idx_local' are out-of-range.")
-
-        return verts_idx_local_.contiguous()
-
-    def _sanitize_verts_tensor(self, tensor, dtype, verts_idx=None, envs_idx=None, element_shape=(), *, batched=True):
-        n_vertices = verts_idx.shape[-1] if verts_idx is not None else self.n_vertices
-        if batched:
-            assert envs_idx is not None
-            batch_shape = (len(envs_idx), n_vertices)
-            dim_names = ("envs_idx", "verts_idx", *("" for _ in element_shape))
-        else:
-            batch_shape = (n_vertices,)
-            dim_names = ("verts_idx", *("" for _ in element_shape))
-        tensor_shape = (*batch_shape, *element_shape)
-
-        return broadcast_tensor(tensor, dtype, tensor_shape, dim_names).contiguous()
 
     def set_position(self, pos):
         """
@@ -175,7 +116,7 @@ class FEMEntity(Entity):
             If the tensor shape is not supported.
         """
         self._assert_active()
-        gs.logger.warning("Manually setting element positions. This is not recommended and could break gradient flow.")
+        gs.logger.warning("Manally setting element positions. This is not recommended and could break gradient flow.")
 
         pos = to_gs_tensor(pos)
 
@@ -183,14 +124,14 @@ class FEMEntity(Entity):
         if pos.ndim == 1:
             if pos.shape == (3,):
                 pos = self.init_positions_COM_offset + pos
-                self._tgt["pos"] = pos[None].tile((self._sim._B, 1, 1))
+                self._tgt["pos"] = pos.unsqueeze(0).tile((self._sim._B, 1, 1))
                 is_valid = True
         elif pos.ndim == 2:
             if pos.shape == (self.n_vertices, 3):
-                self._tgt["pos"] = pos[None].tile((self._sim._B, 1, 1))
+                self._tgt["pos"] = pos.unsqueeze(0).tile((self._sim._B, 1, 1))
                 is_valid = True
             elif pos.shape == (self._sim._B, 3):
-                pos = self.init_positions_COM_offset[None] + pos[:, None]
+                pos = self.init_positions_COM_offset.unsqueeze(0) + pos.unsqueeze(1)
                 self._tgt["pos"] = pos
                 is_valid = True
         elif pos.ndim == 3:
@@ -219,7 +160,7 @@ class FEMEntity(Entity):
             If the tensor shape is not supported.
         """
         self._assert_active()
-        gs.logger.warning("Manually setting element velocities. This is not recommended and could break gradient flow.")
+        gs.logger.warning("Manally setting element velocities. This is not recommended and could break gradient flow.")
 
         vel = to_gs_tensor(vel)
 
@@ -230,10 +171,10 @@ class FEMEntity(Entity):
                 is_valid = True
         elif vel.ndim == 2:
             if vel.shape == (self.n_vertices, 3):
-                self._tgt["vel"] = vel[None].tile((self._sim._B, 1, 1))
+                self._tgt["vel"] = vel.unsqueeze(0).tile((self._sim._B, 1, 1))
                 is_valid = True
             elif vel.shape == (self._sim._B, 3):
-                self._tgt["vel"] = vel[:, None].tile((1, self.n_vertices, 1))
+                self._tgt["vel"] = vel.unsqueeze(1).tile((1, self.n_vertices, 1))
                 is_valid = True
         elif vel.ndim == 3:
             if vel.shape == (self._sim._B, self.n_vertices, 3):
@@ -242,7 +183,6 @@ class FEMEntity(Entity):
         if not is_valid:
             gs.raise_exception("Tensor shape not supported.")
 
-    @assert_muscle
     def set_actuation(self, actu):
         """
         Set the actuation signal for the FEM entity.
@@ -264,14 +204,15 @@ class FEMEntity(Entity):
 
         actu = to_gs_tensor(actu)
 
+        n_groups = getattr(self.material, "n_groups", 1)
+
         is_valid = False
-        n_groups = self.material.n_groups
         if actu.ndim == 0:
             self._tgt["actu"] = actu.tile((self._sim._B, n_groups))
             is_valid = True
         elif actu.ndim == 1:
             if actu.shape == (n_groups,):
-                self._tgt["actu"] = actu[None].tile((self._sim._B, 1))
+                self._tgt["actu"] = actu.unsqueeze(0).tile((self._sim._B, 1))
                 is_valid = True
             elif actu.shape == (self.n_elements,):
                 gs.raise_exception("Cannot set per-element actuation.")
@@ -299,17 +240,19 @@ class FEMEntity(Entity):
         AssertionError
             If tensor shapes are incorrect or normalization fails.
         """
+
         self._assert_active()
 
-        n_groups = self.material.n_groups
-        max_group_id = muscle_group.max().item()
+        if muscle_group is not None:
+            n_groups = getattr(self.material, "n_groups", 1)
+            max_group_id = muscle_group.max().item()
 
-        muscle_group = to_gs_tensor(muscle_group)
+            muscle_group = to_gs_tensor(muscle_group)
 
-        assert muscle_group.shape == (self.n_elements,)
-        assert isinstance(max_group_id, int) and max_group_id < n_groups
+            assert muscle_group.shape == (self.n_elements,)
+            assert isinstance(max_group_id, int) and max_group_id < n_groups
 
-        self.set_muscle_group(muscle_group)
+            self.set_muscle_group(muscle_group)
 
         if muscle_direction is not None:
             muscle_direction = to_gs_tensor(muscle_direction)
@@ -320,7 +263,12 @@ class FEMEntity(Entity):
 
     def get_state(self):
         state = FEMEntityState(self, self._sim.cur_step_global)
-        self.get_frame(self._sim.cur_substep_local, state.pos, state.vel, state.active)
+        self.get_frame(
+            self._sim.cur_substep_local,
+            state.pos,
+            state.vel,
+            state.active,
+        )
 
         # we store all queried states to track gradient flow
         self._queried_states.append(state)
@@ -367,7 +315,7 @@ class FEMEntity(Entity):
         init_positions = (verts - verts_COM) @ R.T + verts_COM
 
         if not init_positions.shape[0] > 0:
-            gs.raise_exception("Entity has zero vertices.")
+            gs.raise_exception(f"Entity has zero vertices.")
 
         self.init_positions = gs.tensor(init_positions)
         self.init_positions_COM_offset = self.init_positions - gs.tensor(verts_COM)
@@ -378,63 +326,39 @@ class FEMEntity(Entity):
         """
         Sample mesh and elements based on the entity's morph type.
 
-        For Cloth material, loads surface mesh directly without tetrahedralization.
-        For regular FEM materials, tetrahedralizes the mesh.
-
         Raises
         ------
         Exception
             If the morph type is unsupported.
         """
-        from genesis.engine.materials.FEM.cloth import Cloth as ClothMaterial
 
-        is_cloth = isinstance(self.material, ClothMaterial)
-
-        if is_cloth:
-            # Cloth: load surface mesh directly (no tetrahedralization)
-            if isinstance(self.morph, gs.options.morphs.Mesh):
-                import trimesh
-
-                mesh = trimesh.load_mesh(self._morph.file)
-                verts = mesh.vertices * self._morph.scale + np.array(self._morph.pos)
-                faces = mesh.faces
-                # For cloth, we store faces as "elements" (treating them as surface elements)
-                self.instantiate(verts, faces)
-            else:
-                gs.raise_exception(f"Cloth material only supports Mesh morph. Got: {self.morph}.")
+        if isinstance(self.morph, gs.options.morphs.Sphere):
+            verts, elems = eu.sphere_to_elements(
+                pos=self._morph.pos,
+                radius=self._morph.radius,
+                tet_cfg=self.tet_cfg,
+            )
+        elif isinstance(self.morph, gs.options.morphs.Box):
+            verts, elems = eu.box_to_elements(
+                pos=self._morph.pos,
+                size=self._morph.size,
+                tet_cfg=self.tet_cfg,
+            )
+        elif isinstance(self.morph, gs.options.morphs.Cylinder):
+            verts, elems = eu.cylinder_to_elements()
+        elif isinstance(self.morph, gs.options.morphs.Mesh):
+            verts, elems = eu.mesh_to_elements(
+                file=self._morph.file,
+                pos=self._morph.pos,
+                scale=self._morph.scale,
+                tet_cfg=self.tet_cfg,
+            )
         else:
-            # Regular FEM: tetrahedralize mesh
-            if isinstance(self.morph, gs.options.morphs.Sphere):
-                verts, elems = eu.sphere_to_elements(
-                    pos=self._morph.pos,
-                    radius=self._morph.radius,
-                    tet_cfg=self.tet_cfg,
-                )
-            elif isinstance(self.morph, gs.options.morphs.Box):
-                verts, elems = eu.box_to_elements(
-                    pos=self._morph.pos,
-                    size=self._morph.size,
-                    tet_cfg=self.tet_cfg,
-                )
-            elif isinstance(self.morph, gs.options.morphs.Cylinder):
-                verts, elems = eu.cylinder_to_elements()
-            elif isinstance(self.morph, gs.options.morphs.Mesh):
-                verts, elems = eu.mesh_to_elements(
-                    file=self._morph.file,
-                    pos=self._morph.pos,
-                    scale=self._morph.scale,
-                    tet_cfg=self.tet_cfg,
-                )
-            else:
-                gs.raise_exception(f"Unsupported morph: {self.morph}.")
+            gs.raise_exception(f"Unsupported morph: {self.morph}.")
 
-            self.instantiate(*eu.split_all_surface_tets(verts, elems))
+        self.instantiate(*eu.split_all_surface_tets(verts, elems))
 
     def _add_to_solver(self, in_backward=False):
-        from genesis.engine.materials.FEM.cloth import Cloth as ClothMaterial
-
-        is_cloth = isinstance(self.material, ClothMaterial)
-
         if not in_backward:
             self._step_global_added = self._sim.cur_step_global
             gs.logger.info(
@@ -442,41 +366,25 @@ class FEMEntity(Entity):
             )
 
         # Convert to appropriate numpy array types
+        elems_np = self.elems.astype(gs.np_int, copy=False)
         verts_numpy = tensor_to_array(self.init_positions, dtype=gs.np_float)
 
-        if is_cloth:
-            # Cloth: add only vertices and surfaces for rendering (no physics computation)
-            gs.logger.info(
-                f"Entity {self.uid} is cloth - adding to FEM solver for rendering only (physics managed by IPC)"
-            )
-            self._solver._kernel_add_cloth_for_rendering(
-                f=self._sim.cur_substep_local,
-                n_surfaces=self._n_surfaces,
-                v_start=self._v_start,
-                s_start=self._s_start,
-                verts=verts_numpy,
-                tri2v=self._surface_tri_np,
-            )
-        else:
-            # Regular FEM: add vertices, elements, and surfaces for physics and rendering
-            elems_np = self.elems.astype(gs.np_int, copy=False)
-            self._solver._kernel_add_elements(
-                f=self._sim.cur_substep_local,
-                mat_idx=self._material.idx,
-                mat_mu=self._material.mu,
-                mat_lam=self._material.lam,
-                mat_rho=self._material.rho,
-                mat_friction_mu=self._material.friction_mu,
-                n_surfaces=self._n_surfaces,
-                v_start=self._v_start,
-                el_start=self._el_start,
-                s_start=self._s_start,
-                verts=verts_numpy,
-                elems=elems_np,
-                tri2v=self._surface_tri_np,
-                tri2el=self._surface_el_np,
-            )
-
+        self._solver._kernel_add_elements(
+            f=self._sim.cur_substep_local,
+            mat_idx=self._material.idx,
+            mat_mu=self._material.mu,
+            mat_lam=self._material.lam,
+            mat_rho=self._material.rho,
+            mat_friction_mu=self._material.friction_mu,
+            n_surfaces=self._n_surfaces,
+            v_start=self._v_start,
+            el_start=self._el_start,
+            s_start=self._s_start,
+            verts=verts_numpy,
+            elems=elems_np,
+            tri2v=self._surface_tri_np,
+            tri2el=self._surface_el_np,
+        )
         self.active = True
 
     def compute_pressure_field(self):
@@ -555,7 +463,7 @@ class FEMEntity(Entity):
         After saving, the internal target buffers are cleared to prepare for new input.
         """
 
-        if ckpt_name not in self._ckpt:
+        if not ckpt_name in self._ckpt:
             self._ckpt[ckpt_name] = {
                 "_tgt_buffer": dict(),
             }
@@ -810,7 +718,6 @@ class FEMEntity(Entity):
             active=active,
         )
 
-    @assert_muscle
     def set_muscle_group(self, muscle_group):
         """
         Set muscle group index for each element.
@@ -827,7 +734,6 @@ class FEMEntity(Entity):
             muscle_group=muscle_group,
         )
 
-    @assert_muscle
     def set_muscle_direction(self, muscle_direction):
         """
         Set muscle force direction for each element.
@@ -844,16 +750,46 @@ class FEMEntity(Entity):
             muscle_direction=muscle_direction,
         )
 
+    def _sanitize_input_tensor(self, tensor, dtype, unbatched_ndim=1):
+        _tensor = torch.as_tensor(tensor, dtype=dtype, device=gs.device)
+
+        if _tensor.ndim < unbatched_ndim + 1:
+            _tensor = _tensor.repeat((self._sim._B, *((1,) * max(1, _tensor.ndim))))
+            if self._sim._B > 1:
+                gs.logger.debug(ALLOCATE_TENSOR_WARNING)
+        else:
+            _tensor = _tensor.contiguous()
+            if _tensor is not tensor:
+                gs.logger.debug(ALLOCATE_TENSOR_WARNING)
+
+            if len(_tensor) != self._sim._B:
+                gs.raise_exception("Input tensor batch size must match the number of environments.")
+
+        if _tensor.ndim != unbatched_ndim + 1:
+            gs.raise_exception(f"Input tensor ndim is {_tensor.ndim}, should be {unbatched_ndim + 1}.")
+
+        return _tensor
+
+    def _sanitize_input_verts_idx(self, verts_idx_local):
+        verts_idx = self._sanitize_input_tensor(verts_idx_local, dtype=gs.tc_int, unbatched_ndim=1) + self._v_start
+        assert ((verts_idx >= 0) & (verts_idx < self._solver.n_vertices)).all(), "Vertex indices out of bounds."
+        return verts_idx
+
+    def _sanitize_input_poss(self, poss):
+        poss = self._sanitize_input_tensor(poss, dtype=gs.tc_float, unbatched_ndim=2)
+        assert poss.ndim == 3 and poss.shape[2] == 3, "Position tensor must have shape (B, num_verts, 3)."
+        return poss
+
     def set_vertex_constraints(
-        self, verts_idx_local, target_poss=None, link=None, is_soft_constraint=False, stiffness=0.0, envs_idx=None
+        self, verts_idx, target_poss=None, link=None, is_soft_constraint=False, stiffness=0.0, envs_idx=None
     ):
         """
         Set vertex constraints for specified vertices.
 
         Parameters
         ----------
-            verts_idx_local : array_like
-                List of local vertex indices to constrain.
+            verts_idx : array_like
+                List of vertex indices to constrain.
             target_poss : array_like, shape (len(verts_idx), 3), optional
                 List of target positions [x, y, z] for each vertex. If not provided, the initial positions are used.
             link : RigidLink
@@ -866,35 +802,38 @@ class FEMEntity(Entity):
             envs_idx : array_like, optional
                 List of environment indices to apply the constraints to. If None, applies to all environments.
         """
-        if self._solver._use_implicit_solver and not self._solver._enable_vertex_constraints:
-            gs.raise_exception(
-                "This feature is disabled. Please set 'enable_vertex_constraints=True' when using FEM implicit solver."
-            )
+        if self._solver._use_implicit_solver:
+            if not self._solver._enable_vertex_constraints:
+                gs.logger.warning("Ignoring vertex constraint; FEM implicit solver needs to enable vertex constraints.")
+                return
 
         if not self._solver._constraints_initialized:
             self._solver.init_constraints()
 
-        use_current_poss = target_poss is None
         envs_idx = self._scene._sanitize_envs_idx(envs_idx)
-        verts_idx_local = self._sanitize_verts_idx_local(verts_idx_local, envs_idx)
-        verts_idx = verts_idx_local + self._v_start
-        target_poss = self._sanitize_verts_tensor(target_poss, gs.tc_float, verts_idx, envs_idx, (3,))
+        verts_idx = self._sanitize_input_verts_idx(verts_idx)
 
-        if use_current_poss:
+        if target_poss is None:
+            target_poss = torch.zeros(
+                (verts_idx.shape[0], verts_idx.shape[1], 3), dtype=gs.tc_float, device=gs.device, requires_grad=False
+            )
             self._kernel_get_verts_pos(self._sim.cur_substep_local, target_poss, verts_idx)
+        target_poss = self._sanitize_input_poss(target_poss)
+
+        assert (
+            len(envs_idx) == len(target_poss) == len(verts_idx)
+        ), "First dimension should match number of environments."
+        assert target_poss.shape[1] == verts_idx.shape[1], "Target position should be provided for each vertex."
 
         if link is None:
-            link_idx = -1
             link_init_pos = torch.zeros((self._sim._B, 3), dtype=gs.tc_float, device=gs.device)
             link_init_quat = torch.zeros((self._sim._B, 4), dtype=gs.tc_float, device=gs.device)
+            link_idx = -1
         else:
             assert isinstance(link, RigidLink), "Only RigidLink is supported for vertex constraints."
+            link_init_pos = self._sanitize_input_tensor(link.get_pos(), dtype=gs.tc_float)
+            link_init_quat = self._sanitize_input_tensor(link.get_quat(), dtype=gs.tc_float)
             link_idx = link.idx
-            link_init_pos = link.get_pos()
-            link_init_quat = link.get_quat()
-            if self._scene.n_envs == 0:
-                link_init_pos = link_init_pos[None]
-                link_init_quat = link_init_quat[None]
 
         self._solver._kernel_set_vertex_constraints(
             self._sim.cur_substep_local,
@@ -908,36 +847,31 @@ class FEMEntity(Entity):
             envs_idx,
         )
 
-    def update_constraint_targets(self, verts_idx_local, target_poss, envs_idx=None):
+    def update_constraint_targets(self, verts_idx, target_poss, envs_idx=None):
         """Update target positions for existing constraints."""
         if not self._solver._constraints_initialized:
             gs.logger.warning("Ignoring update_constraint_targets; constraints have not been initialized.")
             return
 
-        assert target_poss is not None
         envs_idx = self._scene._sanitize_envs_idx(envs_idx)
-        verts_idx_local = self._sanitize_verts_idx_local(verts_idx_local, envs_idx)
-        verts_idx = verts_idx_local + self._v_start
-        target_poss = self._sanitize_verts_tensor(target_poss, gs.tc_float, verts_idx, envs_idx, (3,))
+        verts_idx = self._sanitize_input_verts_idx(verts_idx)
+        target_poss = self._sanitize_input_poss(target_poss)
+        assert target_poss.shape[1] == verts_idx.shape[1], "Target position should be provided for each vertex."
 
         self._solver._kernel_update_constraint_targets(verts_idx, target_poss, envs_idx)
 
-    def remove_vertex_constraints(self, verts_idx_local=None, envs_idx=None):
+    def remove_vertex_constraints(self, verts_idx=None, envs_idx=None):
         """Remove constraints from specified vertices, or all if None."""
         if not self._solver._constraints_initialized:
             gs.logger.warning("Ignoring remove_vertex_constraints; constraints have not been initialized.")
             return
 
-        # FIXME: GsTaichi 'fill' method is very inefficient. Try using zero-copy if possible.
-        if verts_idx_local is None:
+        if verts_idx is None:
             self._solver.vertex_constraints.is_constrained.fill(0)
-            return
-
-        envs_idx = self._scene._sanitize_envs_idx(envs_idx)
-        verts_idx_local = self._sanitize_verts_idx_local(verts_idx_local, envs_idx)
-        verts_idx = verts_idx_local + self._v_start
-
-        self._solver._kernel_remove_specific_constraints(verts_idx, envs_idx)
+        else:
+            verts_idx = self._sanitize_input_verts_idx(verts_idx)
+            envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+            self._solver._kernel_remove_specific_constraints(verts_idx, envs_idx)
 
     @ti.kernel
     def _kernel_get_verts_pos(self, f: ti.i32, pos: ti.types.ndarray(), verts_idx: ti.types.ndarray()):
@@ -956,8 +890,14 @@ class FEMEntity(Entity):
         el2v : gs.Tensor
             Tensor of shape (n_elements, 4) mapping each element to its vertex indices.
         """
+
         el2v = gs.zeros((self.n_elements, 4), dtype=int, requires_grad=False, scene=self.scene)
-        self._solver._kernel_get_el2v(element_el_start=self._el_start, n_elements=self.n_elements, el2v=el2v)
+        self._solver._kernel_get_el2v(
+            element_el_start=self._el_start,
+            n_elements=self.n_elements,
+            el2v=el2v,
+        )
+
         return el2v
 
     @ti.kernel

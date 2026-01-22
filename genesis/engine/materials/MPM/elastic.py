@@ -29,8 +29,7 @@ class Elastic(Base):
     mu: float, optional
         The second Lame's parameter. Default is None, computed by E and nu.
     sampler: str, optional
-        Particle sampler ('pbs', 'regular', 'random'). Note that 'pbs' is only supported on Linux x86 for now. Defaults
-        to 'pbs' on supported platforms, 'random' otherwise.
+        Particle sampler ('pbs', 'regular', 'random'). Default is 'pbs'.
     model: str, optional
         Stress model ('corotation', 'neohooken'). Default is 'corotation'.
     """
@@ -42,7 +41,7 @@ class Elastic(Base):
         rho=1000.0,
         lam=None,
         mu=None,
-        sampler=None,
+        sampler="pbs",
         model="corotation",
     ):
         super().__init__(E, nu, rho, lam, mu, sampler)

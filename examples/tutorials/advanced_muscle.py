@@ -1,10 +1,9 @@
-import os
 import numpy as np
 import genesis as gs
 
 
 ########################## init ##########################
-gs.init(precision="32", logging_level="info")
+gs.init(seed=0, precision="32", logging_level="debug")
 
 ########################## create a scene ##########################
 dt = 5e-4
@@ -66,13 +65,13 @@ robot_fem = scene.add_entity(
 )
 
 ########################## build ##########################
-scene.build(n_envs=0)
+scene.build(n_envs=5)
 
 ########################## run ##########################
-horizon = 1000 if "PYTEST_VERSION" not in os.environ else 5
 scene.reset()
-for i in range(horizon):
-    actu = [0.2 * (0.5 + np.sin(0.01 * np.pi * i))]
+for i in range(1000):
+    actu = np.array([0.2 * (0.5 + np.sin(0.01 * np.pi * i))])
+
     robot_mpm.set_actuation(actu)
     robot_fem.set_actuation(actu)
     scene.step()

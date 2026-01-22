@@ -1,5 +1,4 @@
 import time
-import os
 import numpy as np
 import genesis as gs
 
@@ -54,8 +53,7 @@ def main():
     debug_frame = scene.draw_debug_frame(T=T, axis_length=0.5, origin_size=0.03, axis_radius=0.02)
 
     # Simulation loop
-    horizon = 500 if "PYTEST_VERSION" not in os.environ else 5
-    for step in range(horizon):
+    for step in range(500):
         scene.step()
         time.sleep(0.01)
 

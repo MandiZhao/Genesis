@@ -1,6 +1,11 @@
+import math
+import numpy as np
 import gstaichi as ti
 
 import genesis as gs
+import genesis.utils.geom as gu
+from genesis.engine.entities import SFParticleEntity
+from genesis.engine.boundaries import CubeBoundary
 
 from .base_solver import Solver
 
@@ -30,11 +35,22 @@ class SFSolver(Solver):
         self.t = 0.0
         self.inlet_s = options.inlet_s
 
-        self.jets = ()
+        self.jets = []
+
+    def set_jets(self, jets):
+        self.jets = jets
+
+    def build(self):
+        super().build()
+        if self.is_active():
+            self.t = 0.0
+            self.setup_fields()
+            self.init_fields()
+
+    def is_active(self):
+        return len(self.jets) > 0
 
     def setup_fields(self):
-        assert self.jets
-
         cell_state = ti.types.struct(
             v=gs.ti_vec3,
             v_tmp=gs.ti_vec3,
@@ -53,58 +69,25 @@ class SFSolver(Solver):
 
     @ti.kernel
     def init_fields(self):
-        for I in ti.grouped(ti.ndrange(*self.res)):
+        for i, j, k in ti.ndrange(*self.res):
             for q in ti.static(range(self.grid.q.n)):
-                self.grid.q[I][q] = 0.0
-
-    def reset_grad(self):
-        pass
-
-    def build(self):
-        super().build()
-
-        if self.is_active:
-            self.t = 0.0
-            self.setup_fields()
-            self.init_fields()
-
-        # Overwrite gravity because only field is supported for now
-        if self._gravity is not None:
-            gravity = self._gravity.to_numpy()
-            self._gravity = ti.field(dtype=gs.ti_vec3, shape=(self._B,))
-            self._gravity.from_numpy(gravity)
-
-    # ------------------------------------------------------------------------------------
-    # -------------------------------------- misc ----------------------------------------
-    # ------------------------------------------------------------------------------------
-
-    @property
-    def is_active(self):
-        return bool(self.jets)
-
-    def set_jets(self, jets):
-        assert isinstance(jets, (list, tuple))
-        self.jets = tuple(jets)
+                self.grid.q[i, j, k][q] = 0.0
 
     def reset_swap(self):
         self.p_swap.cur.fill(0)
         self.p_swap.nxt.fill(0)
 
-    # ------------------------------------------------------------------------------------
-    # ----------------------------------- simulation -------------------------------------
-    # ------------------------------------------------------------------------------------
-
     @ti.kernel
     def pressure_jacobi(self, pf: ti.template(), new_pf: ti.template()):
-        for u, v, w in ti.ndrange(*self.res):
-            pl = pf[self.compute_location(u, v, w, -1, 0, 0)]
-            pr = pf[self.compute_location(u, v, w, 1, 0, 0)]
-            pb = pf[self.compute_location(u, v, w, 0, -1, 0)]
-            pt = pf[self.compute_location(u, v, w, 0, 1, 0)]
-            pp = pf[self.compute_location(u, v, w, 0, 0, -1)]
-            pq = pf[self.compute_location(u, v, w, 0, 0, 1)]
+        for i, j, k in ti.ndrange(*self.res):
+            pl = pf[self.compute_location(i, j, k, -1, 0, 0)]
+            pr = pf[self.compute_location(i, j, k, 1, 0, 0)]
+            pb = pf[self.compute_location(i, j, k, 0, -1, 0)]
+            pt = pf[self.compute_location(i, j, k, 0, 1, 0)]
+            pp = pf[self.compute_location(i, j, k, 0, 0, -1)]
+            pq = pf[self.compute_location(i, j, k, 0, 0, 1)]
 
-            new_pf[u, v, w] = (pl + pr + pb + pt + pp + pq - self.grid[u, v, w].div) / 6.0
+            new_pf[i, j, k] = (pl + pr + pb + pt + pp + pq - self.grid[i, j, k].div) / 6.0
 
     @ti.kernel
     def advect_and_impulse(self, f: ti.i32, t: ti.f32):
@@ -131,62 +114,67 @@ class SFSolver(Solver):
 
     @ti.kernel
     def divergence(self):
-        for u, v, w in ti.ndrange(*self.res):
-            vl = self.grid.v_tmp[self.compute_location(u, v, w, -1, 0, 0)]
-            vr = self.grid.v_tmp[self.compute_location(u, v, w, 1, 0, 0)]
-            vb = self.grid.v_tmp[self.compute_location(u, v, w, 0, -1, 0)]
-            vt = self.grid.v_tmp[self.compute_location(u, v, w, 0, 1, 0)]
-            vp = self.grid.v_tmp[self.compute_location(u, v, w, 0, 0, -1)]
-            vq = self.grid.v_tmp[self.compute_location(u, v, w, 0, 0, 1)]
-            vc = self.grid.v_tmp[self.compute_location(u, v, w, 0, 0, 0)]
+        for i, j, k in ti.ndrange(*self.res):
+            vl = self.grid.v_tmp[self.compute_location(i, j, k, -1, 0, 0)]
+            vr = self.grid.v_tmp[self.compute_location(i, j, k, 1, 0, 0)]
+            vb = self.grid.v_tmp[self.compute_location(i, j, k, 0, -1, 0)]
+            vt = self.grid.v_tmp[self.compute_location(i, j, k, 0, 1, 0)]
+            vp = self.grid.v_tmp[self.compute_location(i, j, k, 0, 0, -1)]
+            vq = self.grid.v_tmp[self.compute_location(i, j, k, 0, 0, 1)]
+            vc = self.grid.v_tmp[self.compute_location(i, j, k, 0, 0, 0)]
 
-            if not self.is_free(u, v, w, -1, 0, 0):
+            if not self.is_free(i, j, k, -1, 0, 0):
                 vl.x = -vc.x
-            if not self.is_free(u, v, w, 1, 0, 0):
+            if not self.is_free(i, j, k, 1, 0, 0):
                 vr.x = -vc.x
-            if not self.is_free(u, v, w, 0, -1, 0):
+            if not self.is_free(i, j, k, 0, -1, 0):
                 vb.y = -vc.y
-            if not self.is_free(u, v, w, 0, 1, 0):
+            if not self.is_free(i, j, k, 0, 1, 0):
                 vt.y = -vc.y
-            if not self.is_free(u, v, w, 0, 0, -1):
+            if not self.is_free(i, j, k, 0, 0, -1):
                 vp.z = -vc.z
-            if not self.is_free(u, v, w, 0, 0, 1):
+            if not self.is_free(i, j, k, 0, 0, 1):
                 vq.z = -vc.z
 
-            self.grid.div[u, v, w] = 0.5 * (vr.x - vl.x + vt.y - vb.y + vq.z - vp.z)
+            self.grid.div[i, j, k] = (vr.x - vl.x + vt.y - vb.y + vq.z - vp.z) * 0.5
 
     @ti.kernel
     def pressure_to_swap(self):
-        for I in ti.grouped(ti.ndrange(*self.res)):
-            self.p_swap.cur[I] = self.grid.p[I]
+        for i, j, k in ti.ndrange(*self.res):
+            self.p_swap.cur[i, j, k] = self.grid.p[i, j, k]
 
     @ti.kernel
     def pressure_from_swap(self):
-        for I in ti.grouped(ti.ndrange(*self.res)):
-            self.grid.p[I] = self.p_swap.cur[I]
+        for i, j, k in ti.ndrange(*self.res):
+            self.grid.p[i, j, k] = self.p_swap.cur[i, j, k]
 
     @ti.kernel
     def subtract_gradient(self):
-        for I in ti.grouped(ti.ndrange(*self.res)):
-            u, v, w = I
-            pl = self.grid.p[self.compute_location(u, v, w, -1, 0, 0)]
-            pr = self.grid.p[self.compute_location(u, v, w, 1, 0, 0)]
-            pb = self.grid.p[self.compute_location(u, v, w, 0, -1, 0)]
-            pt = self.grid.p[self.compute_location(u, v, w, 0, 1, 0)]
-            pp = self.grid.p[self.compute_location(u, v, w, 0, 0, -1)]
-            pq = self.grid.p[self.compute_location(u, v, w, 0, 0, 1)]
+        for i, j, k in ti.ndrange(*self.res):
+            pl = self.grid.p[self.compute_location(i, j, k, -1, 0, 0)]
+            pr = self.grid.p[self.compute_location(i, j, k, 1, 0, 0)]
+            pb = self.grid.p[self.compute_location(i, j, k, 0, -1, 0)]
+            pt = self.grid.p[self.compute_location(i, j, k, 0, 1, 0)]
+            pp = self.grid.p[self.compute_location(i, j, k, 0, 0, -1)]
+            pq = self.grid.p[self.compute_location(i, j, k, 0, 0, 1)]
 
-            self.grid.v[I] = self.grid.v_tmp[I] - 0.5 * ti.Vector([pr - pl, pt - pb, pq - pp], dt=gs.ti_float)
+            self.grid.v[i, j, k] = self.grid.v_tmp[i, j, k] - 0.5 * ti.Vector([pr - pl, pt - pb, pq - pp])
 
     @ti.func
     def compute_location(self, u, v, w, du, dv, dw):
-        I = ti.Vector([u + du, v + dv, w + dw], dt=gs.ti_int)
-        return ti.math.clamp(I, 0, self.n_grid - 1)
+        I = ti.Vector([int(u + du), int(v + dv), int(w + dw)])
+        I = max(0, min(self.n_grid - 1, I))
+        return I
 
     @ti.func
     def is_free(self, u, v, w, du, dv, dw):
-        I = ti.Vector([u + du, v + dv, w + dw], dt=gs.ti_int)
-        return gs.ti_bool((0 <= I).all() and (I < self.n_grid).all())
+        flag = 1
+
+        I = ti.Vector([int(u + du), int(v + dv), int(w + dw)])
+        if (I < 0).any() or (I > self.n_grid - 1).any():
+            flag = 0
+
+        return flag
 
     @ti.func
     def trilerp_scalar(self, qf, p, qf_idx):
@@ -274,24 +262,29 @@ class SFSolver(Solver):
     def substep_post_coupling(self, f):
         return
 
-    # ------------------------------------------------------------------------------------
-    # ------------------------------------ gradient --------------------------------------
-    # ------------------------------------------------------------------------------------
-
-    def collect_output_grads(self):
-        pass
-
-    def add_grad_from_state(self, state):
-        pass
+    def reset_grad(self):
+        return None
 
     # ------------------------------------------------------------------------------------
     # --------------------------------------- io -----------------------------------------
     # ------------------------------------------------------------------------------------
 
     def get_state(self, f):
-        pass
+        return None
 
     def set_state(self, f, state, envs_idx=None):
+        return None
+
+    # ------------------------------------------------------------------------------------
+    # ------------------------------------ gradient --------------------------------------
+    # ------------------------------------------------------------------------------------
+    def collect_output_grads(self):
+        """
+        Collect gradients from downstream queried states.
+        """
+        pass
+
+    def add_grad_from_state(self, state):
         pass
 
     def save_ckpt(self, ckpt_name):

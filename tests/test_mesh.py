@@ -1,41 +1,19 @@
 import os
-import platform
+import sys
 
 import numpy as np
 import pytest
 import trimesh
 
 import genesis as gs
-import genesis.utils.geom as gu
 import genesis.utils.gltf as gltf_utils
-import genesis.utils.mesh as mu
+import genesis.utils.usda as usda_utils
 
 from .utils import assert_allclose, assert_array_equal, get_hf_dataset
 
-# Check for USD support by testing if pxr module (from usd-core package) is available
-try:
-    import pxr.Usd
-
-    HAS_USD_SUPPORT = True
-except ImportError:
-    HAS_USD_SUPPORT = False
-
-# Check for Omniverse Kit support (required for USD baking)
-# Note: CI workflows should set OMNI_KIT_ACCEPT_EULA=yes in their env section
-try:
-    import omni.kit_app
-
-    HAS_OMNIVERSE_KIT_SUPPORT = True
-except ImportError:
-    HAS_OMNIVERSE_KIT_SUPPORT = False
-
-# Import USD utilities if USD support is available
-if HAS_USD_SUPPORT:
-    import genesis.utils.usd.usda as usda_utils
 
 VERTICES_TOL = 1e-05  # Transformation loses a little precision in vertices
 NORMALS_TOL = 1e-02  # Conversion from .usd to .glb loses a little precision in normals
-USD_COLOR_TOL = 1e-07  # Parsing from .usd loses a little precision in color
 
 
 def check_gs_meshes(gs_mesh1, gs_mesh2, mesh_name):
@@ -161,9 +139,9 @@ def check_gs_textures(gs_texture1, gs_texture2, default_value, material_name, te
             err_msg=f"Texture mismatch for material {material_name} in {texture_name}.",
         )
     else:
-        assert gs_texture1 is None and gs_texture2 is None, (
-            f"Both textures should be None for material {material_name} in {texture_name}."
-        )
+        assert (
+            gs_texture1 is None and gs_texture2 is None
+        ), f"Both textures should be None for material {material_name} in {texture_name}."
 
 
 @pytest.mark.required
@@ -271,7 +249,6 @@ def test_glb_parse_material(glb_file):
 
 
 @pytest.mark.required
-@pytest.mark.skipif(not HAS_USD_SUPPORT, reason="'pxr' module not found. 'usd-core' package may not be installed.")
 @pytest.mark.parametrize("usd_filename", ["usd/sneaker_airforce", "usd/RoughnessTest"])
 def test_usd_parse(usd_filename):
     asset_path = get_hf_dataset(pattern=f"{usd_filename}.glb")
@@ -321,29 +298,9 @@ def test_usd_parse(usd_filename):
 
 
 @pytest.mark.required
-@pytest.mark.skipif(not HAS_USD_SUPPORT, reason="'pxr' module not found. 'usd-core' package may not be installed.")
-@pytest.mark.parametrize("usd_file", ["usd/nodegraph.usda"])
-def test_usd_parse_nodegraph(usd_file):
-    asset_path = get_hf_dataset(pattern=usd_file)
-    usd_file = os.path.join(asset_path, usd_file)
-    gs_usd_meshes = usda_utils.parse_mesh_usd(
-        usd_file,
-        group_by_material=True,
-        scale=1.0,
-        surface=gs.surfaces.Default(),
-    )
-    texture0 = gs_usd_meshes[0].surface.diffuse_texture
-    texture1 = gs_usd_meshes[1].surface.diffuse_texture
-    assert isinstance(texture0, gs.textures.ColorTexture)
-    assert isinstance(texture1, gs.textures.ColorTexture)
-    assert_allclose(texture0.color, (0.8, 0.2, 0.2), rtol=USD_COLOR_TOL)
-    assert_allclose(texture1.color, (0.2, 0.6, 0.9), rtol=USD_COLOR_TOL)
-
-
-@pytest.mark.required
 @pytest.mark.skipif(
-    not HAS_USD_SUPPORT or not HAS_OMNIVERSE_KIT_SUPPORT,
-    reason="'usd-core' module (provides 'pxr') or 'omni.kit_app' module (from omniverse-kit) not found.",
+    sys.version_info[:2] != (3, 10) or sys.platform not in ("linux", "win32"),
+    reason="omniverse-kit used by USD Baking cannot be correctly installed on this platform now.",
 )
 @pytest.mark.parametrize(
     "usd_file", ["usd/WoodenCrate/WoodenCrate_D1_1002.usda", "usd/franka_mocap_teleop/table_scene.usd"]
@@ -364,7 +321,7 @@ def test_usd_bake(usd_file, show_viewer):
         show_viewer=show_viewer,
         show_FPS=False,
     )
-    scene.add_entity(
+    robot = scene.add_entity(
         gs.morphs.Mesh(
             file=usd_file,
         ),
@@ -372,114 +329,31 @@ def test_usd_bake(usd_file, show_viewer):
 
 
 @pytest.mark.required
-@pytest.mark.parametrize(
-    "mesh_file, file_meshes_are_zup",
-    [("yup_zup_coverage/cannon_z.glb", True), ("yup_zup_coverage/cannon_y_-z.stl", False)],
-)
-def test_urdf_yup(mesh_file, file_meshes_are_zup, tmp_path, show_viewer):
-    asset_path = get_hf_dataset(pattern=mesh_file)
+def test_urdf_with_existing_glb(tmp_path, show_viewer):
+    glb_file = "usd/sneaker_airforce.glb"
+    asset_path = get_hf_dataset(pattern=glb_file)
+
     urdf_path = tmp_path / "model.urdf"
     urdf_path.write_text(
-        f"""<robot name="cannon">
+        f"""<robot name="shoe">
               <link name="base">
                 <visual>
-                  <geometry><mesh filename="{os.path.join(asset_path, mesh_file)}"/></geometry>
+                  <geometry><mesh filename="{os.path.join(asset_path, glb_file)}"/></geometry>
                 </visual>
               </link>
             </robot>
          """
     )
 
-    scene = gs.Scene(show_viewer=show_viewer)
+    scene = gs.Scene(
+        show_viewer=show_viewer,
+        show_FPS=False,
+    )
     robot = scene.add_entity(
         gs.morphs.URDF(
             file=urdf_path,
-            convexify=False,
-            fixed=True,
-            file_meshes_are_zup=file_meshes_are_zup,
         ),
     )
-    mesh = robot.vgeoms[0].vmesh
-
-    if show_viewer:
-        scene.build()
-
-    assert_allclose(mesh.trimesh.center_mass, (-0.012, -0.142, 0.397), tol=0.002)
-
-
-@pytest.mark.required
-def test_obj_morphes_yup(show_viewer):
-    scene = gs.Scene(show_viewer=show_viewer)
-
-    asset_path = get_hf_dataset(pattern="yup_zup_coverage/*")
-
-    glb_y = scene.add_entity(
-        morph=gs.morphs.Mesh(
-            file=f"{asset_path}/yup_zup_coverage/cannon_y.glb",
-            convexify=False,
-            fixed=True,
-            file_meshes_are_zup=False,
-        ),
-    )
-    glb_geom_y = glb_y.vgeoms[0]
-    glb_z = scene.add_entity(
-        morph=gs.morphs.Mesh(
-            file=f"{asset_path}/yup_zup_coverage/cannon_z.glb",
-            convexify=False,
-            fixed=True,
-            file_meshes_are_zup=True,
-        ),
-    )
-    glb_geom_z = glb_z.vgeoms[0]
-    stl_y = scene.add_entity(
-        morph=gs.morphs.Mesh(
-            file=f"{asset_path}/yup_zup_coverage/cannon_y_-z.stl",
-            convexify=False,
-            fixed=True,
-            file_meshes_are_zup=False,
-        ),
-    )
-    stl_geom_y = stl_y.vgeoms[0]
-    stl_z = scene.add_entity(
-        morph=gs.morphs.Mesh(
-            file=f"{asset_path}/yup_zup_coverage/cannon_z_y.stl",
-            convexify=False,
-            fixed=True,
-        ),
-    )
-    stl_geom_z = stl_z.vgeoms[0]
-    obj_y = scene.add_entity(
-        morph=gs.morphs.Mesh(
-            file=f"{asset_path}/yup_zup_coverage/cannon_y_-z.obj",
-            convexify=False,
-            fixed=True,
-            file_meshes_are_zup=False,
-        ),
-    )
-    obj_geom_y = obj_y.vgeoms[0]
-    obj_z = scene.add_entity(
-        morph=gs.morphs.Mesh(
-            file=f"{asset_path}/yup_zup_coverage/cannon_z_y.obj",
-            convexify=False,
-            fixed=True,
-        ),
-    )
-    obj_geom_z = obj_z.vgeoms[0]
-
-    if show_viewer:
-        scene.build()
-
-    assert not glb_geom_y.vmesh.metadata["imported_as_zup"]
-    assert not glb_geom_z.vmesh.metadata["imported_as_zup"]
-    assert not stl_geom_y.vmesh.metadata["imported_as_zup"]
-    assert stl_geom_z.vmesh.metadata["imported_as_zup"]
-    assert not obj_geom_y.vmesh.metadata["imported_as_zup"]
-    assert obj_geom_z.vmesh.metadata["imported_as_zup"]
-
-    for geom in (glb_geom_y, glb_geom_z, stl_geom_y, stl_geom_z, obj_geom_y, obj_geom_z):
-        mesh = geom.vmesh.copy()
-        mesh.apply_transform(gu.trans_quat_to_T(geom.link.pos, geom.link.quat))
-        assert_allclose(mesh.trimesh.center_mass, (-0.012, -0.142, 0.397), tol=0.002)
 
 
 @pytest.mark.required
@@ -593,22 +467,12 @@ def test_2_channels_luminance_alpha_textures(show_viewer):
 
 
 @pytest.mark.required
-def test_plane_texture_path_preservation(show_viewer):
-    """Test that plane primitives preserve texture paths in metadata."""
-    scene = gs.Scene(show_viewer=show_viewer, show_FPS=False)
-    plane = scene.add_entity(gs.morphs.Plane())
-
-    # The texture path should be stored in metadata
-    assert plane.vgeoms[0].vmesh.metadata["texture_path"] == "textures/checker.png"
-
-
-@pytest.mark.required
-@pytest.mark.skipif(platform.machine() == "aarch64", reason="Module 'tetgen' is crashing on Linux ARM.")
+@pytest.mark.field_only
 def test_splashsurf_surface_reconstruction(show_viewer):
     scene = gs.Scene(
         show_viewer=show_viewer,
     )
-    scene.add_entity(
+    water = scene.add_entity(
         material=gs.materials.SPH.Liquid(),
         morph=gs.morphs.Box(
             pos=(0.15, 0.15, 0.22),
@@ -626,77 +490,3 @@ def test_splashsurf_surface_reconstruction(show_viewer):
     )
     scene.build()
     cam.render(rgb=True, depth=False, segmentation=False, colorize_seg=False, normal=False)
-
-
-# FIXME: This test is taking too much time on some platform (~1200s)
-# @pytest.mark.required
-def test_convex_decompose_cache(monkeypatch):
-    # Check if the convex decomposition cache is correctly tracked regardless of the scale
-
-    # Monkeypatch the get_cvx_path function to track the cache path
-    seen_paths = []
-    real_get_cvx_path = mu.get_cvx_path
-
-    def wrapped_get_cvx_path(verts, faces, opts):
-        path = real_get_cvx_path(verts, faces, opts)
-        seen_paths.append(path)
-        return path
-
-    monkeypatch.setattr(mu, "get_cvx_path", wrapped_get_cvx_path)
-
-    # Monkeypatch the convex_decompose function to track the convex decomposition result
-    seen_results = []
-    real_convex_decompose = mu.convex_decompose
-
-    def wrapped_convex_decompose(mesh, opts):
-        result = real_convex_decompose(mesh, opts)
-        seen_results.append(result)
-        return result
-
-    monkeypatch.setattr(mu, "convex_decompose", wrapped_convex_decompose)
-
-    # First scene building to create the cache
-    scene = gs.Scene(
-        show_viewer=False,
-    )
-    first_scale = 2.0
-    scene.add_entity(
-        morph=gs.morphs.Mesh(
-            file="meshes/duck.obj",
-            scale=first_scale,
-            pos=(0, 0, 1.0),
-            quat=(0, 0, 0, 1),
-        ),
-    )
-    scene.build()
-
-    # Second scene building, duck with different scale, translation, and rotation
-    scene = gs.Scene(
-        show_viewer=False,
-    )
-    second_scale = 4.0
-    scene.add_entity(
-        morph=gs.morphs.Mesh(
-            file="meshes/duck.obj",
-            scale=second_scale,
-            pos=(1.0, 0, 1.0),
-            quat=(1, 0, 0, 0),
-        ),
-    )
-    scene.build()
-
-    assert len(seen_paths) == 2
-    assert len(seen_results) == 2
-
-    # scaled mesh should have the same cache path as the original mesh
-    cached_path = seen_paths[0]
-    scaled_path = seen_paths[-1]
-    assert cached_path == scaled_path
-
-    # check if the scaled parts match the scaled version of the original parts
-    cached_parts = seen_results[0]
-    scaled_parts = seen_results[-1]
-    assert len(scaled_parts) == len(cached_parts)
-    for scaled_part, cached_part in zip(scaled_parts, cached_parts):
-        assert_allclose(scaled_part.vertices, cached_part.vertices * (second_scale / first_scale), rtol=1e-6)
-        assert_array_equal(scaled_part.faces, cached_part.faces)

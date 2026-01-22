@@ -1,5 +1,7 @@
+import numpy as np
 import gstaichi as ti
 
+import genesis as gs
 
 from ..base import Material
 

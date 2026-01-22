@@ -8,6 +8,7 @@ import genesis as gs
 
 
 def main():
+
     parser = argparse.ArgumentParser()
     parser.add_argument("-v", "--vis", action="store_true", default=False)
     args = parser.parse_args()

@@ -1,6 +1,6 @@
 import argparse
-import os
 
+import numpy as np
 
 import genesis as gs
 
@@ -12,7 +12,7 @@ def main():
     args = parser.parse_args()
 
     ########################## init ##########################
-    gs.init(backend=gs.cpu if args.cpu else gs.gpu, logging_level="info")
+    gs.init(backend=gs.cpu if args.cpu else gs.gpu, logging_level="debug")
 
     ########################## create a scene ##########################
 
@@ -48,7 +48,7 @@ def main():
     ########################## build ##########################
     scene.build()
 
-    horizon = 1000 if "PYTEST_VERSION" not in os.environ else 5
+    horizon = 1000
     # forward pass
     for i in range(horizon):
         scene.step()

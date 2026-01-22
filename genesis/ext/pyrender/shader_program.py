@@ -1,5 +1,4 @@
 """OpenGL shader program wrapper."""
-
 import numbers
 import os
 import re
@@ -8,7 +7,9 @@ import numpy as np
 
 import OpenGL
 from OpenGL.GL import *
+from OpenGL.platform import ctypesloader
 from OpenGL.GL import shaders as gl_shader_utils
+from time import time
 
 func = None
 
@@ -90,6 +91,7 @@ class ShaderProgram(object):
     """
 
     def __init__(self, vertex_shader, fragment_shader, geometry_shader=None, defines=None):
+
         self.vertex_shader = vertex_shader
         self.fragment_shader = fragment_shader
         self.geometry_shader = geometry_shader
@@ -209,22 +211,22 @@ class ShaderProgram(object):
             # self._unif_map[name] = value.size, value.shape
             if value.ndim == 1:
                 if np.issubdtype(value.dtype, np.unsignedinteger) or unsigned:
-                    value = np.ascontiguousarray(value, np.uint32)
+                    value = value.astype(np.uint32, copy=False)
                 elif np.issubdtype(value.dtype, np.integer):
-                    value = np.ascontiguousarray(value, dtype=np.int32)
+                    value = value.astype(np.int32, copy=False)
                 else:
-                    value = np.ascontiguousarray(value, dtype=np.float32)
+                    value = value.astype(np.float32, copy=False)
                 func = self._FUNC_MAP[(len(value), value.dtype.kind)]
                 func(loc, 1, value)
             else:
-                value = np.ascontiguousarray(value, dtype=np.float32)
+                value = value.astype(np.float32, copy=False)
                 func = self._FUNC_MAP[tuple(value.shape[:2])]
                 func(loc, 1, GL_TRUE, value)
 
         # Call correct uniform function
         elif isinstance(value, (numbers.Real, np.floating)):
             glUniform1f(loc, float(value))
-        elif isinstance(value, (numbers.Integral, np.integer)):
+        elif isinstance(value, (numbers.Integer, np.integer)):
             if unsigned:
                 glUniform1ui(loc, int(value))
             else:

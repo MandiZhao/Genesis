@@ -1,11 +1,9 @@
-import os
-
 import numpy as np
 import genesis as gs
 
 
 ########################## init ##########################
-gs.init(precision="32", logging_level="info")
+gs.init(seed=0, precision="32", logging_level="debug")
 
 ######################## create a scene ##########################
 scene = gs.Scene(
@@ -53,10 +51,10 @@ robot = scene.add_entity(
         fixed=True,
     ),
     material=gs.materials.Hybrid(
-        material_rigid=gs.materials.Rigid(
+        mat_rigid=gs.materials.Rigid(
             gravity_compensation=1.0,
         ),
-        material_soft=gs.materials.MPM.Muscle(  # to allow setting group
+        mat_soft=gs.materials.MPM.Muscle(  # to allow setting group
             E=1e4,
             nu=0.45,
             rho=1000.0,
@@ -79,9 +77,15 @@ ball = scene.add_entity(
 scene.build()
 
 ########################## run ##########################
-horizon = 1000 if "PYTEST_VERSION" not in os.environ else 5
 scene.reset()
-for i in range(horizon):
-    dofs_ctrl = [1.0 * np.sin(2 * np.pi * i * 0.001)] * robot.n_dofs
+for i in range(1000):
+    dofs_ctrl = np.array(
+        [
+            1.0 * np.sin(2 * np.pi * i * 0.001),
+        ]
+        * robot.n_dofs
+    )
+
     robot.control_dofs_velocity(dofs_ctrl)
+
     scene.step()

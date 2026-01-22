@@ -18,8 +18,8 @@ class TensorRingBuffer:
     buffer : torch.Tensor | None, optional
         The buffer tensor where all the data is stored. If not provided, a new tensor is allocated.
     idx : torch.Tensor, optional
-        The index reference to the most recently updated position in the ring buffer as a mutable 0D torch.Tensor of
-        integer dtype. If not provided, it is initialized to -1.
+        The index reference to the current position in the ring buffer as a mutable 0D torch.Tensor of integer dtype.
+        If not provided, it is initialized to 0.
     """
 
     def __init__(
@@ -37,11 +37,23 @@ class TensorRingBuffer:
             self.buffer = buffer
         self.N = N
         if idx is None:
-            self._idx = torch.tensor(-1, dtype=torch.int64, device=gs.device)
+            self._idx = torch.tensor(0, dtype=torch.int64, device=gs.device)
         else:  # torch.Tensor
             assert idx.ndim == 0 and idx.dtype in (torch.int32, torch.int64)
             self._idx = idx.to(device=gs.device)
             assert self._idx is idx
+
+    def append(self, tensor: torch.Tensor):
+        """
+        Copy the tensor into the next position of the ring buffer, and advance the index pointer.
+
+        Parameters
+        ----------
+        tensor : torch.Tensor
+            The tensor to copy into the ring buffer.
+        """
+        self.buffer[self._idx].copy_(tensor)
+        self._idx[()] = (self._idx + 1) % self.N
 
     def at(
         self, idx: int | torch.Tensor, *others_idx: int | slice | torch.Tensor, copy: bool | None = None
@@ -70,7 +82,7 @@ class TensorRingBuffer:
             if copy:
                 tensor = tensor.clone()
         elif copy == False:
-            gs.raise_exception("Allocating memory is necessary but 'copy=False'.")
+            raise gs.GenesisException("Allocating memory is necessary but 'copy=False'.")
         return tensor
 
     def get(self, idx: int) -> torch.Tensor:
@@ -82,24 +94,7 @@ class TensorRingBuffer:
         idx : int
             Index of the element to get from most recent to least recent (that has not been discarded yet).
         """
-        return self.buffer[idx].clone()
-
-    def set(self, tensor: torch.Tensor):
-        """
-        Set the current position of the ring buffer.
-
-        Parameters
-        ----------
-        tensor : torch.Tensor
-            The tensor to copy into the ring buffer.
-        """
-        self.buffer[self._idx] = tensor
-
-    def rotate(self):
-        """
-        , and advance the index pointer
-        """
-        self._idx[()] = (self._idx + 1) % self.N
+        return self.at(idx, copy=True)
 
     def clone(self) -> "TensorRingBuffer":
         return TensorRingBuffer(
@@ -107,7 +102,7 @@ class TensorRingBuffer:
             self.buffer.shape[1:],
             dtype=self.buffer.dtype,
             buffer=self.buffer.clone(),
-            idx=self._idx.clone(),
+            idx=self._idx,
         )
 
     def __getitem__(self, key: int | slice | tuple) -> "TensorRingBuffer":

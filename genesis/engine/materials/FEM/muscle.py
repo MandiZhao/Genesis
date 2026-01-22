@@ -1,4 +1,5 @@
 import gstaichi as ti
+import genesis as gs
 from .elastic import Elastic
 
 

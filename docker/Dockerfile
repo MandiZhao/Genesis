@@ -69,7 +69,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bash-completion \
     libgl1 \
     libgl1-mesa-glx \
-    libglu1-mesa \
     libegl-dev \
     libegl1 \
     libxrender1 \

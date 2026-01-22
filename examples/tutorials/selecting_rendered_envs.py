@@ -1,4 +1,3 @@
-import os
 import genesis as gs
 
 gs.init()
@@ -27,6 +26,5 @@ franka = scene.add_entity(
 
 scene.build(n_envs=20, env_spacing=(1.0, 1.0))
 
-horizon = 1000 if "PYTEST_VERSION" not in os.environ else 5
-for i in range(horizon):
+for i in range(1000):
     scene.step()

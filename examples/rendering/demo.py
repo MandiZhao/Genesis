@@ -1,9 +1,11 @@
+import torch
+
 import genesis as gs
 
 
 def main():
     ########################## init ##########################
-    gs.init(precision="32", logging_level="info")
+    gs.init(seed=0, precision="32", logging_level="debug")
 
     ########################## create a scene ##########################
     scene = gs.Scene(
@@ -149,8 +151,10 @@ def main():
         spp=512,
     )
     scene.build()
+
+    ########################## forward + backward twice ##########################
     scene.reset()
-    horizon = 10
+    horizon = 2000
 
     for i in range(horizon):
         scene.step()

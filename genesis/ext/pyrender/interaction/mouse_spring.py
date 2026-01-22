@@ -1,24 +1,26 @@
-from typing import TYPE_CHECKING
 
-import torch
+from genesis.engine.entities.rigid_entity.rigid_entity import RigidEntity
+from genesis.engine.entities.rigid_entity.rigid_geom import RigidGeom
 
-from .vec3 import Pose, Quat, Vec3
+from .ray import Plane, Ray, RayHit
+from .vec3 import Pose, Quat, Vec3, Color
 
-if TYPE_CHECKING:
-    from genesis.engine.entities.rigid_entity.rigid_link import RigidLink
-
+from genesis.engine.entities.rigid_entity.rigid_link import RigidLink
 
 MOUSE_SPRING_POSITION_CORRECTION_FACTOR = 1.0
 MOUSE_SPRING_VELOCITY_CORRECTION_FACTOR = 1.0
 
+def _ensure_torch_imported() -> None:
+    global torch
+    import torch
 
 class MouseSpring:
     def __init__(self) -> None:
-        self.held_link: "RigidLink | None" = None
+        self.held_link: RigidLink | None = None
         self.held_point_in_local: Vec3 | None = None
         self.prev_control_point: Vec3 | None = None
 
-    def attach(self, picked_link: "RigidLink", control_point: Vec3) -> None:
+    def attach(self, picked_link: RigidLink, control_point: Vec3) -> None:
         # for now, we just pick the first geometry
         self.held_link = picked_link
         pose: Pose = Pose.from_link(self.held_link)
@@ -29,15 +31,17 @@ class MouseSpring:
         self.held_link = None
 
     def apply_force(self, control_point: Vec3, delta_time: float) -> None:
+        _ensure_torch_imported()
+
         # note when threaded: apply_force is called before attach!
         # note2: that was before we added a lock to ViewerInteraction; this migth be fixed now
         if not self.held_link:
             return
-
+        
         self.prev_control_point = control_point
 
         # do simple force on COM only:
-        link: "RigidLink" = self.held_link
+        link: RigidLink = self.held_link
         lin_vel: Vec3 = Vec3.from_tensor(link.get_vel())
         ang_vel: Vec3 = Vec3.from_tensor(link.get_ang())
         link_pose: Pose = Pose.from_link(link)
@@ -48,8 +52,7 @@ class MouseSpring:
         link_T_principal: Pose = Pose(Vec3.from_arraylike(link.inertial_pos), Quat.from_arraylike(link.inertial_quat))
         world_T_principal: Pose = link_pose * link_T_principal
 
-        # for non-spherical inertia
-        arm_in_principal: Vec3 = link_T_principal.inverse_transform_point(self.held_point_in_local)
+        arm_in_principal: Vec3 = link_T_principal.inverse_transform_point(self.held_point_in_local)   # for non-spherical inertia
         arm_in_world: Vec3 = world_T_principal.rot * arm_in_principal  # for spherical inertia
 
         pos_err_v: Vec3 = control_point - held_point_in_world
@@ -63,7 +66,7 @@ class MouseSpring:
         total_impulse: Vec3 = Vec3.zero()
         total_torque_impulse: Vec3 = Vec3.zero()
 
-        for i in range(3 * 4):
+        for i in range(3*4):
             body_point_vel: Vec3 = lin_vel + ang_vel.cross(arm_in_world)
             vel_err_v: Vec3 = Vec3.zero() - body_point_vel
 
@@ -85,10 +88,10 @@ class MouseSpring:
         # Apply the new force
         total_force = total_impulse * inv_dt
         total_torque = total_torque_impulse * inv_dt
-        force_tensor: torch.Tensor = total_force.as_tensor()[None]
-        torque_tensor: torch.Tensor = total_torque.as_tensor()[None]
-        link.solver.apply_links_external_force(force_tensor, (link.idx,), ref="link_com", local=False)
-        link.solver.apply_links_external_torque(torque_tensor, (link.idx,), ref="link_com", local=False)
+        force_tensor: torch.Tensor = total_force.as_tensor().unsqueeze(0)
+        torque_tensor: torch.Tensor = total_torque.as_tensor().unsqueeze(0)
+        link.solver.apply_links_external_force(force_tensor, (link.idx,), ref='link_com', local=False)
+        link.solver.apply_links_external_torque(torque_tensor, (link.idx,), ref='link_com', local=False)
 
     @property
     def is_attached(self) -> bool:

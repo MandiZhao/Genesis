@@ -1,4 +1,3 @@
-import os
 import genesis as gs
 
 ########################## init ##########################
@@ -70,6 +69,6 @@ obj_plastic = scene.add_entity(
 ########################## build ##########################
 scene.build()
 
-horizon = 1000 if "PYTEST_VERSION" not in os.environ else 5
+horizon = 1000
 for i in range(horizon):
     scene.step()

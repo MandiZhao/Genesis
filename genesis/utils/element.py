@@ -7,6 +7,7 @@ import igl
 
 import genesis as gs
 
+from . import geom as gu
 from . import mesh as mu
 
 
@@ -46,7 +47,7 @@ def mesh_to_elements(file, pos=(0, 0, 0), scale=1.0, tet_cfg=dict()):
             with open(tet_file_path, "rb") as file:
                 verts, elems = pkl.load(file)
             is_cached_loaded = True
-        except (EOFError, ModuleNotFoundError, pkl.UnpicklingError, TypeError, MemoryError):
+        except (EOFError, ModuleNotFoundError, pkl.UnpicklingError):
             gs.logger.info("Ignoring corrupted cache.")
 
     if not is_cached_loaded:
@@ -70,7 +71,11 @@ def split_all_surface_tets(verts, elems):
     """
     F, *_ = igl.boundary_facets(elems)
     on_surface = np.zeros(verts.shape[0], dtype=bool)
-    on_surface[F.reshape(-1)] = True
+    on_surface[
+        F.reshape(
+            -1,
+        )
+    ] = True
     all_on_surface = np.all(on_surface[elems], axis=1)
     if not all_on_surface.any():
         return verts, elems

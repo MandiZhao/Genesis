@@ -1,6 +1,8 @@
 import numpy as np
 import torch
 
+import genesis as gs
+
 
 def brief(x):
     if hasattr(x, "_repr_brief"):

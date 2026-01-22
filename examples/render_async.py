@@ -1,4 +1,3 @@
-import os
 import threading
 
 import genesis as gs
@@ -7,8 +6,6 @@ import genesis as gs
 def run_sim(scene):
     for _ in range(200):
         scene.step(refresh_visualizer=False)
-        if "PYTEST_VERSION" in os.environ:
-            break
 
 
 def main():
@@ -42,8 +39,7 @@ def main():
     scene.build()
 
     threading.Thread(target=run_sim, args=(scene,)).start()
-    if "PYTEST_VERSION" not in os.environ:
-        scene.viewer.run()
+    scene.viewer.run()
 
 
 if __name__ == "__main__":

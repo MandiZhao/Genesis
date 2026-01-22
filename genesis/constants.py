@@ -6,6 +6,14 @@ import gstaichi as ti
 ACTIVE = 1
 INACTIVE = 0
 
+# misc
+EPS = None
+SEED = None
+
+# logging
+logger = None
+error_msg = None
+
 
 class IntEnum(enum.IntEnum):
     def __repr__(self):
@@ -87,8 +95,6 @@ class IMAGE_TYPE(IntEnum):
         return self.name
 
 
-# FIXME: Remove this static map entirely and rather determines the appropriate GPU backend dynamically, based on
-# hardware (using torch default device)
 GS_ARCH = {
     "macOS": {
         backend.cpu: backend.cpu,
@@ -110,7 +116,6 @@ GS_ARCH = {
     },
 }
 
-# FIXME: The list of support backends should honor `TI_ENABLE_*` env var
 TI_ARCH = {
     "macOS": {
         backend.cpu: ti.cpu,

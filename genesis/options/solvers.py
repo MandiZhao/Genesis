@@ -153,12 +153,8 @@ class SAPCouplerOptions(BaseCouplerOptions):
         VERT would be preferable when the mesh is very coarse, such as a single cube or a tetrahedron.
     enable_fem_self_tet_contact : bool, optional
         Whether to use tetrahedral based self-contact. Defaults to True.
-    rigid_rigid_type : str, optional
-        Type of contact between rigid bodies. Defaults to "tet". Can be "tet", "vert", or "none".
     rigid_floor_contact_type : str, optional
-        Type of contact against the floor. Defaults to "tet". Can be "tet", "vert", or "none".
-        Tet would be the default choice for most cases.
-        Vert would be preferable when the mesh is very coarse, such as a single cube or a tetrahedron.
+        Type of contact against the floor for rigid bodies. Defaults to "vert". Can be "vert" or "none".
     enable_rigid_fem_contact : bool, optional
         Whether to enable coupling between rigid and FEM solvers. Defaults to True.
     """
@@ -178,78 +174,8 @@ class SAPCouplerOptions(BaseCouplerOptions):
     point_contact_stiffness: float = 1e8
     fem_floor_contact_type: str = "tet"
     enable_fem_self_tet_contact: bool = True
-    rigid_floor_contact_type: str = "tet"
+    rigid_floor_contact_type: str = "vert"
     enable_rigid_fem_contact: bool = True
-    rigid_rigid_contact_type: str = "tet"
-
-
-class IPCCouplerOptions(BaseCouplerOptions):
-    """
-    Options configuring the Incremental Potential Contact (IPC) coupler.
-
-    Parameters
-    ----------
-    dt : float, optional
-        Time step for IPC simulation. Defaults to 0.001.
-    gravity : tuple, optional
-        Gravity vector for IPC simulation. Defaults to (0.0, 0.0, -9.8).
-    contact_d_hat : float, optional
-        Contact distance threshold. Defaults to 0.001.
-    contact_friction_enable : bool, optional
-        Whether to enable friction in contact. Defaults to True.
-    contact_friction_mu : float, optional
-        Friction coefficient. Defaults to 0.5.
-    contact_resistance : float, optional
-        Contact resistance/stiffness. Defaults to 1e9.
-    newton_velocity_tol : float, optional
-        Velocity tolerance for Newton solver. Defaults to 0.001.
-    line_search_max_iter : int, optional
-        Maximum iterations for line search. Defaults to 30.
-    linear_system_tol_rate : float, optional
-        Tolerance rate for linear system solver. Defaults to 1e-4.
-    sanity_check_enable : bool, optional
-        Whether to enable sanity checks. Defaults to False.
-    ipc_constraint_strength : tuple, optional
-        Strength ratios for IPC soft transform constraint coupling. Tuple of (translation_strength, rotation_strength).
-        Higher values create stiffer coupling between Genesis rigid bodies and IPC ABD objects. Defaults to (100.0, 100.0).
-    two_way_coupling : bool, optional
-        Whether to enable bidirectional coupling between IPC and Genesis rigid bodies.
-        When True, forces from IPC ABD constraint are applied back to Genesis rigid bodies.
-        When False, only Genesis → IPC coupling is active (one-way). Defaults to True.
-    IPC_self_contact : bool, optional
-        Whether to enable contact detection between rigid bodies in IPC system (ABD-ABD collisions).
-        When False, only FEM-FEM and FEM-ABD collisions are detected. Defaults to False.
-    disable_genesis_ground_contact : bool, optional
-        Whether to disable ground contact in Genesis rigid solver when using IPC.
-        When True, ground collision is only handled by IPC system, not by Genesis rigid solver.
-        This can be useful to avoid double-counting ground contacts. Defaults to False.
-    disable_ipc_ground_contact : bool, optional
-        Whether to disable ground contact in IPC system.
-        When True, all objects in IPC (FEM, cloth, rigid ABD) will not collide with ground plane.
-        Defaults to False.
-    disable_ipc_logging : bool, optional
-        Whether to disable IPC library logging output. Defaults to True.
-    enable_ipc_gui : bool, optional
-        Whether to enable IPC GUI visualization using polyscope. Defaults to False.
-    """
-
-    dt: float = 0.001
-    gravity: tuple = (0.0, 0.0, -9.8)
-    contact_d_hat: float = 0.001
-    contact_friction_enable: bool = True
-    contact_friction_mu: float = 0.5
-    contact_resistance: float = 1e9
-    newton_velocity_tol: float = 0.001
-    line_search_max_iter: int = 30
-    linear_system_tol_rate: float = 1e-4
-    sanity_check_enable: bool = False
-    ipc_constraint_strength: tuple = (100.0, 100.0)
-    two_way_coupling: bool = True
-    IPC_self_contact: bool = False
-    disable_genesis_ground_contact: bool = False
-    disable_ipc_ground_contact: bool = False
-    disable_ipc_logging: bool = True
-    enable_ipc_gui: bool = False
 
 
 ############################ Solvers inside simulator ############################
@@ -294,9 +220,6 @@ class RigidOptions(Options):
         Whether to enable joint limit. Defaults to True.
     enable_self_collision : bool, optional
         Whether to enable self collision within each entity. Defaults to True.
-    enable_neutral_collision : bool, optional
-        Whether to enable self collision occurring in neutral configuration (qpos0) within each entity. Defaults to
-        False.
     enable_adjacent_collision : bool, optional
         Whether to enable collision between successive parent-child body pairs within each entity. Defaults to False.
     disable_constraint: bool, optional
@@ -320,7 +243,7 @@ class RigidOptions(Options):
     iterations : int, optional
         Number of iterations for the constraint solver. Defaults to 50.
     tolerance : float, optional
-        Tolerance for the constraint solver. Defaults to 1e-6.
+        Tolerance for the constraint solver. Defaults to 1e-8.
     ls_iterations : int, optional
         Number of line search iterations for the constraint solver. Defaults to 50.
     ls_tolerance : float, optional
@@ -352,8 +275,7 @@ class RigidOptions(Options):
     max_dynamic_constraints : int, optional
         Maximum number of dynamic constraints (like suction cup). Defaults to 8.
     use_gjk_collision: bool, optional
-        Whether to use GJK for collision detection instead of MPR. More stable but much slower. Defaults to
-        `sim_options.requires_grad`.
+        Whether to use GJK for collision detection instead of MPR. Defaults to True.
 
     Warning
     -------
@@ -365,11 +287,9 @@ class RigidOptions(Options):
     enable_collision: bool = True
     enable_joint_limit: bool = True
     enable_self_collision: bool = True
-    enable_neutral_collision: bool = False
     enable_adjacent_collision: bool = False
     disable_constraint: bool = False
-    max_collision_pairs: int = 150
-    multiplier_collision_broad_phase: int = 8
+    max_collision_pairs: int = 300
     integrator: gs.integrator = gs.integrator.approximate_implicitfast
     IK_max_targets: int = 6
 
@@ -381,7 +301,7 @@ class RigidOptions(Options):
     # constraint solver
     constraint_solver: gs.constraint_solver = gs.constraint_solver.Newton
     iterations: int = 50
-    tolerance: float = 1e-6
+    tolerance: float = 1e-8
     ls_iterations: int = 50
     ls_tolerance: float = 1e-2
     noslip_iterations: int = 0
@@ -390,7 +310,7 @@ class RigidOptions(Options):
     contact_resolve_time: Optional[float] = None
     constraint_timeconst: float = 0.01
     use_contact_island: bool = False
-    box_box_detection: bool = False
+    box_box_detection: bool = True
 
     # hibernation threshold
     use_hibernation: bool = False
@@ -405,10 +325,43 @@ class RigidOptions(Options):
     enable_mujoco_compatibility: bool = False
 
     # GJK collision detection
-    use_gjk_collision: Optional[bool] = None
+    use_gjk_collision: bool = True
 
     def __init__(self, **data):
         super().__init__(**data)
+
+
+class AvatarOptions(Options):
+    """
+    Options configuring the AvatarSolver. AvatarEntity is similar to RigidEntity, but without internal physics.
+
+    Parameters
+    ----------
+    dt : float, optional
+        Time duration for each simulation step in seconds. If none, it will inherit from `SimOptions`. Defaults to None.
+    enable_collision : float, optional
+        Whether to enable collision detection. Defaults to False.
+    enable_self_collision : float, optional
+        Whether to enable self collision within each entity. Defaults to False.
+    enable_adjacent_collision : bool, optional
+        Whether to enable collision between successive parent-child body pairs within each entity. Defaults to False.
+    max_collision_pairs : int, optional
+        Maximum number of collision pairs. Defaults to 100.
+    IK_max_targets : int, optional
+        Maximum number of IK targets. Increasing this doesn't affect IK solving speed, but will increase memory usage. Defaults to 6.
+    max_dynamic_constraints : int, optional
+        Maximum number of dynamic constraints (like suction cup). Defaults to 8.
+    """
+
+    dt: Optional[float] = None
+    enable_collision: bool = False
+    enable_self_collision: bool = False
+    enable_adjacent_collision: bool = False
+    max_collision_pairs: int = 300
+    IK_max_targets: int = 6  # Increasing this doesn't affect IK solving speed, but will increase memory usage
+
+    # for dynamic properties
+    max_dynamic_constraints: int = 8
 
 
 class MPMOptions(Options):
@@ -418,6 +371,8 @@ class MPMOptions(Options):
     Note
     ----
     MPM is a hybrid lagrangian-eulerian method for simulating soft materials. In the eulerian phase, it uses a grid representation. The `upper_bound` and `lower_bound` specify the simulation domain, but a safety padding will be added to the actual grid boundary. Therefore, the actual boundary could be slightly tighter than the specified one. Note that the size of the domain affects the performance of the simulation, hence you should set it as tight as possible.
+
+    `use_sparse_grid` and `leaf_block_size` are advanced parameters for sparse computation. Don't touch them unless you know what you are doing.
 
     Parameters
     ----------
@@ -436,9 +391,9 @@ class MPMOptions(Options):
     upper_bound : tuple, shape (3,), optional
         Upper bound of the simulation domain. Defaults to (1.0, 1.0, 1.0).
     use_sparse_grid : bool, optional
-        This option is deprecated.
+        Whether to use sparse grid. Defaults to False. Don't touch unless you know what you are doing.
     leaf_block_size : int, optional
-        This option is deprecated.
+        Size of the leaf block for sparse mode. Defaults to 8.
     """
 
     dt: Optional[float] = None
@@ -451,13 +406,15 @@ class MPMOptions(Options):
     lower_bound: tuple = (-1.0, -1.0, 0.0)
     upper_bound: tuple = (1.0, 1.0, 1.0)
 
-    # Deprecated sparse computation parameter.
+    # Sparse computation parameter. Don't touch unless you know what you are doing.
     use_sparse_grid: bool = False
-    leaf_block_size: int = 8
+    leaf_block_size: int = (
+        8  # NOTE: taichi_elements uses 4, which in our case will hang and crash. Probably due to some memory access issue.
+    )
 
     def __init__(self, **data):
         super().__init__(**data)
-        if not np.all(np.asarray(self.upper_bound) > np.asarray(self.lower_bound)):
+        if not np.all(np.array(self.upper_bound) > np.array(self.lower_bound)):
             gs.raise_exception("Invalid pair of upper_bound and lower_bound.")
 
         if self.particle_size is None:

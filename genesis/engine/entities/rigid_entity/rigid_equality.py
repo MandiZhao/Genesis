@@ -1,6 +1,8 @@
 import gstaichi as ti
+import torch
 
 import genesis as gs
+import genesis.utils.geom as gu
 from genesis.repr_base import RBC
 
 
@@ -42,8 +44,8 @@ class RigidEquality(RBC):
         """
         Set the solver parameters of this equality constraint.
         """
-        if self._solver.is_built:
-            self._solver.set_sol_params(sol_params, eqs_idx=self._idx, envs_idx=None)
+        if self.is_built:
+            self._solver.set_sol_params(sol_params[..., None, :], eqs_idx=self._idx, envs_idx=None, unsafe=False)
         else:
             self._sol_params = sol_params
 
@@ -52,8 +54,8 @@ class RigidEquality(RBC):
         """
         Returns the solver parameters of this equality constraint.
         """
-        if self._solver.is_built:
-            return self._solver.get_sol_params(eqs_idx=self._idx, envs_idx=None)[..., 0, :]
+        if self.is_built:
+            return self._solver.get_sol_params(eqs_idx=self._idx, envs_idx=None, unsafe=True)[..., 0, :]
         return self._sol_params
 
     # ------------------------------------------------------------------------------------

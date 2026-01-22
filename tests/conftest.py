@@ -1,30 +1,26 @@
 import base64
 import ctypes
 import gc
-import logging
 import os
 import re
-import subprocess
-from argparse import SUPPRESS
 import sys
 from enum import Enum
 from io import BytesIO
 from pathlib import Path
 
-import setproctitle
 import psutil
 import pyglet
 import pytest
 from _pytest.mark import Expression, MarkMatcher
 from PIL import Image
 from syrupy.extensions.image import PNGImageSnapshotExtension
+from syrupy.location import PyTestLocation
 
 has_display = True
 try:
     from tkinter import Tk
 
     root = Tk()
-    root.withdraw()
     root.destroy()
 except Exception:  # ImportError, TclError
     # Mock tkinter module for backward compatibility because it is a hard dependency for old Genesis versions
@@ -45,10 +41,9 @@ except ImportError:
     has_egl = False
 
 if not has_display and has_egl:
-    # It is necessary to configure pyglet in headless mode if necessary before importing Genesis.
-    # Note that environment variables are used instead of global options to ease option propagation to subprocesses.
+    # It is necessary to configure pyglet in headless mode if necessary before importing Genesis
     pyglet.options["headless"] = True
-    os.environ["PYGLET_HEADLESS"] = "1"
+    os.environ["GS_VIEWER_ALLOW_OFFSCREEN"] = "1"
 
 IS_INTERACTIVE_VIEWER_AVAILABLE = has_display or has_egl
 
@@ -56,15 +51,6 @@ TOL_SINGLE = 5e-5
 TOL_DOUBLE = 1e-9
 IMG_STD_ERR_THR = 1.0
 IMG_NUM_ERR_THR = 0.001
-
-
-def is_mem_monitoring_supported():
-    try:
-        assert sys.platform.startswith("linux")
-        subprocess.check_output(["nvidia-smi"], stderr=subprocess.STDOUT, timeout=2)
-        return True, None
-    except Exception as exc:  # platform or nvidia-smi unavailable
-        return False, exc
 
 
 def pytest_make_parametrize_id(config, val, argname):
@@ -77,28 +63,9 @@ def pytest_make_parametrize_id(config, val, argname):
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_cmdline_main(config: pytest.Config) -> None:
-    # Make sure that no unsupported markers have been specified in CLI
-    declared_markers = set(name for spec in config.getini("markers") if (name := spec.split(":")[0]) != "forked")
-    try:
-        eval(config.option.markexpr, {"__builtins__": {}}, {key: None for key in declared_markers})
-    except NameError as e:
-        raise pytest.UsageError(f"Unknown marker in CLI expression: '{e.name}'")
-
-    # Only launch memory monitor from the main process, not from xdist workers
-    mem_filepath = config.getoption("--mem-monitoring-filepath")
-    if mem_filepath and not os.environ.get("PYTEST_XDIST_WORKER"):
-        supported, reason = is_mem_monitoring_supported()
-        if not supported:
-            raise pytest.UsageError(f"--mem-monitoring-filepath is not supported on this platform: {reason}")
-        subprocess.Popen(
-            [
-                sys.executable,
-                "tests/monitor_test_mem.py",
-                "--die-with-parent",
-                "--out-csv-filepath",
-                mem_filepath,
-            ]
-        )
+    # Force disabling forked for non-linux systems
+    if not sys.platform.startswith("linux"):
+        config.option.forked = False
 
     # Make sure that benchmarks are running on GPU and the number of workers if valid
     expr = Expression.compile(config.option.markexpr)
@@ -110,66 +77,28 @@ def pytest_cmdline_main(config: pytest.Config) -> None:
             raise ValueError("Running benchmarks on CPU is not supported.")
         config.option.backend = "gpu"
 
-    # Force disabling forked for non-linux systems
-    if not sys.platform.startswith("linux"):
-        config.option.forked = False
+        # Make sure that the number of workers is not too large
+        if isinstance(config.option.numprocesses, int):
+            max_workers = max(pytest_xdist_auto_num_workers(config), 1)
+            if config.option.numprocesses > max_workers:
+                raise ValueError(
+                    f"The number of workers for running benchmarks cannot exceed '{max_workers}' on this machine."
+                )
 
     # Force disabling distributed framework if interactive viewer is enabled
     show_viewer = config.getoption("--vis")
     if show_viewer:
         config.option.numprocesses = 0
 
-    # Force disabling reruns if debugger is enabled
-    is_pdb_enabled = config.getoption("--pdb")
-    if is_pdb_enabled:
-        config.option.reruns = 0
-
-    # Force headless rendering if available and the interactive viewer is disabled.
-    # FIXME: It breaks rendering on some platform...
-    # if not show_viewer and has_egl:
-    #     pyglet.options["headless"] = True
-
-    # Make sure that the number of workers is not too large if specified
-    if isinstance(config.option.numprocesses, int):
-        max_workers = max(pytest_xdist_auto_num_workers(config), 1)
-        if config.option.numprocesses > max_workers:
-            raise ValueError(f"The number of workers cannot exceed '{max_workers}' on this machine.")
-
-    # Properly configure Taichi std out stream right away to avoid significant performance penalty (~10%)
-    # Note that this variable must be set in the main thread BEFORE spawning the distributed workers, otherwise
-    # the variable will be set incorrectly. Although, Genesis is already setting this env variable properly at import,
-    # relying on this mechanism is fragile.
-    os.environ.setdefault("TI_ENABLE_PYBUF", "0" if sys.stdout is sys.__stdout__ else "1")
-
-    # Disable GsTaichi dynamic array mode by default on MacOS because it is not supported by Metal
-    if sys.platform == "darwin":
-        os.environ.setdefault("GS_ENABLE_NDARRAY", "0")
-
-    # Enforce special environment variable before importing test modules if distributed framework is enabled
-    worker_id = os.environ.get("PYTEST_XDIST_WORKER")
-    if worker_id and worker_id.startswith("gw"):
-        # Enforce GPU affinity
-        worker_num = int(worker_id[2:])
-        gpu_indices = _get_gpu_indices()
-        gpu_index = gpu_indices[worker_num % len(gpu_indices)]
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
-        os.environ["TI_VISIBLE_DEVICE"] = str(gpu_index)
-
-        # Limit CPU threading
-        if is_benchmarks:
-            # FIXME: Enabling multi-threading in benchmark is making compile time estimation unreliable
-            num_cpu_per_worker = "1"
-        else:
-            physical_core_count = psutil.cpu_count(logical=config.option.logical)
-            num_workers = int(os.environ["PYTEST_XDIST_WORKER_COUNT"])
-            num_cpu_per_worker = str(max(int(physical_core_count / num_workers), 1))
-        os.environ["TI_NUM_THREADS"] = num_cpu_per_worker
-        os.environ["OMP_NUM_THREADS"] = num_cpu_per_worker
-        os.environ["OPENBLAS_NUM_THREADS"] = num_cpu_per_worker
-        os.environ["MKL_NUM_THREADS"] = num_cpu_per_worker
-        os.environ["VECLIB_MAXIMUM_THREADS"] = num_cpu_per_worker
-        os.environ["NUMEXPR_NUM_THREADS"] = num_cpu_per_worker
-        os.environ["NUMBA_NUM_THREADS"] = num_cpu_per_worker
+    # Disable low-level parallelization if distributed framework is enabled.
+    # FIXME: It should be set to `max(int(physical_core_count / num_workers), 1)`, but 'num_workers' may be unknown.
+    if not is_benchmarks and config.option.numprocesses != 0:
+        os.environ["OMP_NUM_THREADS"] = "1"
+        os.environ["OPENBLAS_NUM_THREADS"] = "1"
+        os.environ["MKL_NUM_THREADS"] = "1"
+        os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+        os.environ["NUMEXPR_NUM_THREADS"] = "1"
+        os.environ["NUMBA_NUM_THREADS"] = "1"
 
 
 def _get_gpu_indices():
@@ -188,26 +117,6 @@ def _get_gpu_indices():
             return tuple(sorted(nvidia_gpu_indices))
 
     return (0,)
-
-
-def _torch_get_gpu_idx(device):
-    if sys.platform == "darwin":
-        return 0
-
-    if sys.platform == "linux":
-        import torch
-
-        device_property = torch.cuda.get_device_properties(device)
-        device_uuid = str(device_property.uuid)
-
-        nvidia_gpu_interface_path = "/proc/driver/nvidia/gpus/"
-        for device_path in os.listdir(nvidia_gpu_interface_path):
-            with open(os.path.join(nvidia_gpu_interface_path, device_path, "information"), "r") as f:
-                device_info = f.read()
-            if re.search(rf"GPU UUID:\s+GPU-{device_uuid}", device_info):
-                return int(re.search(r"Device Minor:\s+(\d+)", device_info).group(1))
-
-    return -1
 
 
 def _get_egl_index(gpu_index):
@@ -254,121 +163,59 @@ def _get_egl_index(gpu_index):
 
 
 def pytest_xdist_auto_num_workers(config):
+    import genesis as gs
+
     # Get available memory (RAM & VRAM) and number of cores
     physical_core_count = psutil.cpu_count(logical=config.option.logical)
-    ram_memory = psutil.virtual_memory().total / 1024**3
-    if sys.platform == "darwin":
-        # On Apple ARM, cpu and gpu are part of the same physical device with unified memory
-        num_gpus = 1
-        vram_memory = ram_memory
-    else:
-        # Cannot rely on 'torch' because this would force loading devices before configuring CUDA device visibility
-        devices_vram_memory = None
-        try:
-            result = subprocess.run(
-                ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True,
-                text=True,
-            )
-            devices_vram_memory = tuple(int(e.strip()) for e in result.stdout.splitlines())
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            try:
-                result = subprocess.run(
-                    ["rocm-smi", "--showmeminfo", "vram", "-d", "0-255"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    check=True,
-                    text=True,
-                )
-                devices_vram_memory = tuple(
-                    int(m.group(1)) for m in re.finditer(r"VRAM Total:\s+(\d+)\s*MiB", result.stdout)
-                )
-            except (FileNotFoundError, subprocess.CalledProcessError):
-                pass
-        if devices_vram_memory is not None:
-            assert len(set(devices_vram_memory)) == 1, "Heterogeonous Nvidia GPU devices not supported."
-            num_gpus = len(devices_vram_memory)
-            vram_memory = sum(devices_vram_memory) / 1024
-        else:
-            # FIXME: There is easy way for Intel ARC device. Ignore device visibilty issue for now...
-            import torch
-
-            if torch.xpu.is_available():
-                num_gpus = torch.xpu.device_count()
-                vram_memory = 0.0
-                for device_idx in range(num_gpus):
-                    device = torch.device("xpu", device_idx)
-                    device_property = torch.cuda.get_device_properties(device)
-                    vram_memory += device_property.total_memory / 1024**3
-            else:
-                # Ignore VRAM if no GPU is available
-                num_gpus = 0
-                vram_memory = float("inf")
+    _, _, ram_memory, _ = gs.utils.get_device(gs.cpu)
+    _, _, vram_memory, backend = gs.utils.get_device(gs.gpu)
+    num_gpus = len(_get_gpu_indices())
+    vram_memory *= num_gpus
+    if backend == gs.cpu:
+        # Ignore VRAM if no GPU is available
+        vram_memory = float("inf")
 
     # Compute the default number of workers based on available RAM, VRAM, and number of physical cores.
     # Note that if `forked` is not enabled, up to 7.5Gb per worker is necessary on Linux because Taichi
     # does not completely release memory between each test.
-    if sys.platform == "darwin":
-        ram_memory_per_worker = vram_memory_per_worker = 3.0
+    if sys.platform in ("darwin", "win32"):
+        ram_memory_per_worker = 3.0
+        vram_memory_per_worker = 1.0  # Does not really makes sense on Apple Silicon
     elif config.option.forked:
         ram_memory_per_worker = 5.5
-        vram_memory_per_worker = 1.8
+        vram_memory_per_worker = 1.2
     else:
         ram_memory_per_worker = 7.5
-        vram_memory_per_worker = 2.5
+        vram_memory_per_worker = 1.6
     num_workers = min(
         physical_core_count,
-        max(ram_memory / ram_memory_per_worker, 1),
-        max(vram_memory / vram_memory_per_worker, 1),
+        max(int(ram_memory / ram_memory_per_worker), 1),
+        max(int(vram_memory / vram_memory_per_worker), 1),
     )
 
     # Special treatment for benchmarks
     expr = Expression.compile(config.option.markexpr)
     is_benchmarks = expr.evaluate(MarkMatcher.from_markers((pytest.mark.benchmarks,)))
     if is_benchmarks:
-        num_cpu_per_gpu = 8
+        num_cpu_per_gpu = 4
         num_workers = min(
             num_workers,
             num_gpus,
-            max(physical_core_count / num_cpu_per_gpu, 1),
+            max(int(physical_core_count / num_cpu_per_gpu), 1),
         )
 
-    return int(num_workers)
+    return num_workers
 
 
-@pytest.hookimpl(trylast=True)
-def pytest_collection_modifyitems(config, items):
-    # Run slow tests first
-
-    slow = [item for item in items if "slow" in item.keywords]
-    fast = [item for item in items if "slow" not in item.keywords]
-
-    max_workers = config.option.numprocesses
-    if max_workers is None:
-        max_workers = int(os.environ["PYTEST_XDIST_WORKER_COUNT"])
-    max_workers = max(max_workers, 1)
-
-    buckets = [[] for _ in range(max_workers)]
-    for idx, item in enumerate(slow + fast):
-        bucket_idx = idx % max_workers
-        buckets[bucket_idx].append(item)
-    items[:] = [item for bucket in sorted(buckets, key=len) for item in bucket]
-
-
-@pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item):
-    # Include test name in process title
-    test_name = item.nodeid.replace(" ", "")
-    setproctitle.setproctitle(f"pytest: {test_name}")
-
-    # Match CUDA device with EGL device.
-    # Note that this must be done here instead of 'pytest_cmdline_main', otherwise it will segfault when using
-    # 'pytest-forked', because EGL instances are not allowed to cross thread boundaries.
+    # Enforce GPU affinity if distributed framework is enabled
     worker_id = os.environ.get("PYTEST_XDIST_WORKER")
     if worker_id and worker_id.startswith("gw"):
-        gpu_index = int(os.environ["CUDA_VISIBLE_DEVICES"])
+        worker_num = int(worker_id[2:])
+        gpu_indices = _get_gpu_indices()
+        gpu_index = gpu_indices[worker_num % len(gpu_indices)]
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+        os.environ["TI_VISIBLE_DEVICE"] = str(gpu_index)
         try:
             os.environ["EGL_DEVICE_ID"] = str(_get_egl_index(gpu_index))
         except Exception:
@@ -382,13 +229,6 @@ def pytest_addoption(parser):
     )
     parser.addoption("--vis", action="store_true", default=False, help="Enable interactive viewer.")
     parser.addoption("--dev", action="store_true", default=False, help="Enable genesis debug mode.")
-    supported, _reason = is_mem_monitoring_supported()
-    help_text = (
-        "Run memory monitoring, and store results to mem_monitoring_filepath. CUDA on linux ONLY."
-        if supported
-        else SUPPRESS
-    )
-    parser.addoption("--mem-monitoring-filepath", type=str, help=help_text)
 
 
 @pytest.fixture(scope="session")
@@ -525,34 +365,8 @@ def taichi_offline_cache(request):
     return taichi_offline_cache
 
 
-@pytest.fixture
-def performance_mode(request):
-    performance_mode = None
-    for mark in request.node.iter_markers("performance_mode"):
-        if mark.args:
-            if performance_mode is not None:
-                pytest.fail("'performance_mode' can only be specified once.")
-            (performance_mode,) = mark.args
-    if performance_mode is None:
-        performance_mode = False
-    return performance_mode
-
-
-@pytest.fixture
-def debug(request):
-    debug = None
-    for mark in request.node.iter_markers("debug"):
-        if mark.args:
-            if debug is not None:
-                pytest.fail("'debug' can only be specified once.")
-            (debug,) = mark.args
-    return debug
-
-
 @pytest.fixture(scope="function", autouse=True)
-def initialize_genesis(
-    request, monkeypatch, tmp_path, backend, precision, performance_mode, debug, taichi_offline_cache
-):
+def initialize_genesis(request, monkeypatch, backend, precision, taichi_offline_cache):
     import genesis as gs
 
     # Early return if backend is None
@@ -560,50 +374,39 @@ def initialize_genesis(
         yield
         return
 
-    logging_level = request.config.getoption("--log-cli-level", logging.INFO)
-    if debug is None:
-        debug = request.config.getoption("--dev")
-
-    if not taichi_offline_cache:
-        monkeypatch.setenv("TI_OFFLINE_CACHE", "0")
-        # FIXME: Must set temporary cache even if caching is forcibly disabled because this flag is not always honored
-        monkeypatch.setenv("TI_OFFLINE_CACHE_FILE_PATH", str(tmp_path / ".cache" / "taichi"))
-        monkeypatch.setenv("GS_CACHE_FILE_PATH", str(tmp_path / ".cache" / "genesis"))
-        monkeypatch.setenv("GS_ENABLE_FASTCACHE", "0")
-
-    # Redirect name terrain cache directory to some test-local temporary location to avoid conflict and persistence
-    monkeypatch.setattr("genesis.utils.misc.get_gnd_cache_dir", lambda: str(tmp_path / ".cache" / "terrain"))
+    logging_level = request.config.getoption("--log-cli-level")
+    debug = request.config.getoption("--dev")
 
     try:
-        # Skip if requested backend is not available
+        if not taichi_offline_cache:
+            monkeypatch.setenv("TI_OFFLINE_CACHE", "0")
+
+        # Skip test if gstaichi ndarray mode is enabled but not supported by this specific test
+        if os.environ.get("GS_USE_NDARRAY") == "1":
+            for mark in request.node.iter_markers("field_only"):
+                if not mark.args or mark.args[0]:
+                    pytest.skip(f"This test does not support GsTaichi ndarray mode. Skipping...")
+            if os.environ.get("GS_BETA_PURE") == "1" and backend != gs.cpu and sys.platform == "darwin":
+                pytest.skip("fast cache not supported on mac gpus when using ndarray.")
+
         try:
             gs.utils.get_device(backend)
         except gs.GenesisException:
             pytest.skip(f"Backend '{backend}' not available on this machine")
-
-        # Skip test if not supported by this machine
-        if sys.platform == "darwin" and backend != gs.cpu:
-            if os.environ.get("TI_ENABLE_METAL", "1") != "0" and precision == "64":
-                pytest.skip("Apple Metal GPU does not support 64bits precision.")
-            if os.environ.get("GS_ENABLE_NDARRAY") == "1":
-                pytest.skip(
-                    "Using GsTaichi dynamic array type is not supported on Apple Metal GPU because this backend only "
-                    "supports up to 31 kernel parameters, which is not enough for most solvers."
-                )
-
-        gs.init(
-            backend=backend,
-            precision=precision,
-            debug=debug,
-            seed=0,
-            logging_level=logging_level,
-            performance_mode=performance_mode,
-        )
+        gs.init(backend=backend, precision=precision, debug=debug, seed=0, logging_level=logging_level)
         gc.collect()
 
-        if gs.backend != gs.cpu and gs.device.index is not None:
-            if _torch_get_gpu_idx(gs.device) not in _get_gpu_indices():
-                raise RuntimeError("Wrong CUDA GPU device.")
+        if gs.backend != gs.cpu:
+            device_index = gs.device.index
+            if device_index is not None and device_index not in _get_gpu_indices():
+                assert RuntimeError("Wrong CUDA GPU device.")
+
+        import gstaichi as ti
+
+        ti_runtime = ti.lang.impl.get_runtime()
+        ti_config = ti.lang.impl.current_cfg()
+        if ti_config.arch == ti.metal and precision == "64":
+            pytest.skip("Apple Metal GPU does not support 64bits precision.")
 
         if backend != gs.cpu and gs.backend == gs.cpu:
             pytest.skip("No GPU available on this machine")
@@ -697,7 +500,7 @@ def box_obj_path(asset_tmp_path, cube_verts_and_faces):
     """Fixture that generates a temporary cube .obj file"""
     verts, faces = cube_verts_and_faces
 
-    filename = str(asset_tmp_path / "fixture_box_obj_path.obj")
+    filename = str(asset_tmp_path / f"fixture_box_obj_path.obj")
     with open(filename, "w", encoding="utf-8") as f:
         for x, y, z in verts:
             f.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
@@ -721,11 +524,7 @@ class PixelMatchSnapshotExtension(PNGImageSnapshotExtension):
             buffer.write(data)
             buffer.seek(0)
             img_arrays.append(np.atleast_3d(np.asarray(Image.open(buffer))).astype(np.int32))
-
-        if img_arrays[0].shape != img_arrays[1].shape:
-            return False
-
-        img_delta = np.minimum(np.abs(img_arrays[1] - img_arrays[0]), 255).astype(np.uint8)
+        img_delta = np.minimum(np.abs(np.diff(img_arrays, axis=0)), 255).astype(np.uint8)
         if (
             np.max(np.std(img_delta.reshape((-1, img_delta.shape[-1])), axis=0)) > self._std_err_threshold
             and (np.abs(img_delta) > np.finfo(np.float32).eps).sum() > self._ratio_err_threshold * img_delta.size
